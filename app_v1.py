@@ -5,6 +5,7 @@ import re
 import os
 import sqlite3
 import uuid
+from fpdf import FPDF
 
 # Set up the OpenAI API key from Streamlit secrets
 openai.api_key = st.secrets["OPENAI_API_KEY"]
@@ -67,7 +68,7 @@ def get_protocol_data(nct_number):
         
         protocol_section = study_data.get('protocolSection', {})
         results_section = study_data.get('resultsSection', {})
-
+        
         if not protocol_section:
             return None, None, "Error: Study data could not be found for this NCT number."
 
@@ -88,6 +89,8 @@ def get_protocol_data(nct_number):
         # Design Module
         design_module = protocol_section.get('designModule', {})
         study_type = design_module.get('studyType', 'N/A')
+        study_design = design_module.get('studyDesignInfo', {}).get('studyDesign', 'N/A')
+        study_phase = design_module.get('phaseList', {}).get('phase', ['N/A'])[0]
         
         # Interventions and Arm Groups
         arms_interventions_module = protocol_section.get('armsInterventionsModule', {})
@@ -145,6 +148,8 @@ def get_protocol_data(nct_number):
             "Official Title": official_title,
             "Overall Status": overall_status,
             "Study Type": study_type,
+            "Study Design": study_design,
+            "Study Phase": study_phase,
             "Brief Summary": brief_summary,
             "Detailed Description": detailed_description,
             "Study Arms and Treatment Plans": arm_groups_text,
@@ -154,7 +159,7 @@ def get_protocol_data(nct_number):
             "Adverse Events": adverse_events_text
         }
 
-        return data_to_summarize, None, None
+        return data_to_summarize, nct_id, None
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
             return None, None, f"Error: Study with NCT number {nct_number} was not found on ClinicalTrials.gov."
@@ -175,6 +180,46 @@ def summarize_with_gpt4o(messages):
         return None, f"OpenAI API Error: {e}"
     except Exception as e:
         return None, f"An unexpected error occurred during summarization: {e}"
+
+def create_summary_pdf(summary_text, nct_id):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    pdf.set_margins(10, 10, 10)
+    
+    # Add Title
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(200, 10, txt=f"Clinical Protocol Summary for NCT ID: {nct_id}", ln=True, align='C')
+    pdf.ln(5)
+
+    # Add URL
+    pdf.set_font("Arial", 'U', 10)
+    url_text = f"https://clinicaltrials.gov/study/NCT{nct_id}"
+    pdf.set_text_color(0, 0, 255) # Blue
+    pdf.cell(0, 10, url_text, 0, 1, 'L', link=url_text)
+    pdf.set_text_color(0, 0, 0) # Black
+    pdf.ln(5)
+
+    # Add Summary Content
+    pdf.set_font("Arial", size=12)
+    # This will handle markdown-style headers and bold text
+    lines = summary_text.split('\n')
+    for line in lines:
+        if line.startswith('### **'):
+            pdf.set_font("Arial", 'B', 14)
+            pdf.cell(0, 10, line.replace('### **', '').replace('**', ''), ln=True)
+            pdf.set_font("Arial", '', 12)
+        elif line.startswith('**'):
+            pdf.set_font("Arial", 'B', 12)
+            pdf.write(5, line.replace('**', '') + " ")
+            pdf.set_font("Arial", '', 12)
+        else:
+            pdf.write(5, line)
+        
+        if line.strip() == "":
+            pdf.ln(5)
+
+    return pdf.output(dest='S').encode('latin1')
 
 # --- Streamlit UI and Chat Management ---
 
@@ -218,7 +263,7 @@ if url_input and nct_match and not st.session_state.messages:
     nct_number = nct_match.group(0)
     st.info(f"Found NCT number: **{nct_number}**. Fetching protocol details...")
     
-    data_to_summarize, _, fetch_error = get_protocol_data(nct_number)
+    data_to_summarize, nct_id, fetch_error = get_protocol_data(nct_number)
 
     if fetch_error:
         st.error(fetch_error)
@@ -252,6 +297,15 @@ if url_input and nct_match and not st.session_state.messages:
         st.session_state.messages.append({"role": "assistant", "content": full_summary})
         with st.chat_message("assistant"):
             st.markdown(full_summary)
+            
+        st.download_button(
+            label="Download Summary as PDF",
+            data=create_summary_pdf(full_summary, nct_id),
+            file_name=f"clinical_trial_summary_{nct_id}.pdf",
+            mime="application/pdf"
+        )
+        
+        st.markdown(f"**<a href='https://clinicaltrials.gov/study/NCT{nct_id}' target='_blank'>View Full Protocol on ClinicalTrials.gov</a>**", unsafe_allow_html=True)
         
         save_message_to_db(st.session_state.current_convo_id, "assistant", full_summary)
             
