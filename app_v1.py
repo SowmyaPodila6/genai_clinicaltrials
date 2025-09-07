@@ -108,7 +108,7 @@ init_db()
 # Check for rerun flag at the top of the script
 if "rerun_flag" in st.session_state and st.session_state.rerun_flag:
     st.session_state.rerun_flag = False
-    st.experimental_rerun()
+    st.rerun()
 
 st.title("Clinical Trial Protocol Summarizer Chatbot (SQLite)")
 
