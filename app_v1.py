@@ -6,11 +6,17 @@ import os
 import sqlite3
 import uuid
 
-# --- Best Practices: Centralize Database Connection with caching ---
-@st.cache_resource
+# Set up the OpenAI API key from Streamlit secrets
+openai.api_key = st.secrets["OPENAI_API_KEY"]
+
+# Define the database file
+DB_FILE = "chat_history.db"
+
+# --- Database Helper Functions ---
+
+# Connects to the database and ensures the table exists
 def get_db_connection():
-    """Returns a cached database connection."""
-    conn = sqlite3.connect("chat_history.db")
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS chat_messages (
@@ -23,14 +29,13 @@ def get_db_connection():
     conn.commit()
     return conn
 
-# --- Database Helper Functions ---
-
 def save_message_to_db(conversation_id, role, content):
     """Saves a single message to the database with a conversation ID."""
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("INSERT INTO chat_messages (conversation_id, role, content) VALUES (?, ?, ?)", (conversation_id, role, content))
     conn.commit()
+    conn.close()
 
 def load_messages_from_db(conversation_id):
     """Loads all chat messages for a specific conversation ID."""
@@ -38,6 +43,7 @@ def load_messages_from_db(conversation_id):
     c = conn.cursor()
     c.execute("SELECT role, content FROM chat_messages WHERE conversation_id = ? ORDER BY id", (conversation_id,))
     messages = [{"role": row[0], "content": row[1]} for row in c.fetchall()]
+    conn.close()
     return messages
 
 def get_all_conversations():
@@ -46,6 +52,7 @@ def get_all_conversations():
     c = conn.cursor()
     c.execute("SELECT DISTINCT conversation_id FROM chat_messages ORDER BY id DESC")
     conversations = [row[0] for row in c.fetchall()]
+    conn.close()
     return conversations
 
 # --- App Logic ---
