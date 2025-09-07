@@ -1016,7 +1016,8 @@ if url_input and nct_match and not st.session_state.messages:
 [Create a simple table if multiple arms exist, otherwise describe briefly]
 
 ### Eligibility Criteria
-[Key inclusion criteria and exclusion criteria in 1-2 sentences]
+#### Key inclusion criteria
+#### Key exclusion criteria
 
 ### Enrollment & Participant Flow
 [Patient numbers and enrollment status if available]
