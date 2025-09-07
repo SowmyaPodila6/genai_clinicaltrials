@@ -122,6 +122,7 @@ for convo_id in conversations:
 if st.sidebar.button("Start New Chat", key="new_chat_button"):
     st.session_state.messages = []
     st.session_state.current_convo_id = str(uuid.uuid4())
+    st.session_state.url_key = str(uuid.uuid4()) # Added to reset the URL input
     st.session_state.rerun_flag = True
 
 st.markdown("Enter a ClinicalTrials.gov URL to start a conversation about the study.")
@@ -131,6 +132,7 @@ if "messages" not in st.session_state:
 
 if "current_convo_id" not in st.session_state:
     st.session_state.current_convo_id = str(uuid.uuid4())
+    st.session_state.url_key = str(uuid.uuid4()) # Initialize the URL key
 
 # Display existing chat messages
 for message in st.session_state.messages:
@@ -138,7 +140,7 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 # Handle the initial URL input
-url_input = st.text_input("ClinicalTrials.gov URL:", placeholder="e.g., https://clinicaltrials.gov/study/NCT01234567")
+url_input = st.text_input("ClinicalTrials.gov URL:", placeholder="e.g., https://clinicaltrials.gov/study/NCT01234567", key=st.session_state.url_key)
 
 nct_match = re.search(r"NCT\d{8}", url_input)
 
