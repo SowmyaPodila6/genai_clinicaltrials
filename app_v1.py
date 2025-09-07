@@ -474,7 +474,7 @@ def summarize_with_gpt4o(messages):
     except Exception as e:
         return None, f"An unexpected error occurred during summarization: {e}"
 
-def create_summary_pdf(summary_text, nct_id, study_title=""):
+def create_summary_pdf(summary_text, nct_id):
     try:
         from fpdf import FPDF
         import unicodedata
@@ -497,17 +497,11 @@ def create_summary_pdf(summary_text, nct_id, study_title=""):
         
         class CustomPDF(FPDF):
             def header(self):
-                # Set header with study info
-                self.set_font('Arial', 'B', 12)
+                # Set header with study info - removed long title to prevent cutoff
+                self.set_font('Arial', 'B', 14)
                 self.set_text_color(0, 51, 102)  # Dark blue
                 self.cell(0, 10, f'Clinical Trial Summary: {nct_id}', 0, 1, 'C')
-                if study_title:
-                    self.set_font('Arial', '', 10)
-                    self.set_text_color(0, 0, 0)  # Black
-                    # Truncate title if too long
-                    display_title = study_title[:80] + "..." if len(study_title) > 80 else study_title
-                    self.cell(0, 8, display_title, 0, 1, 'C')
-                self.ln(5)
+                self.ln(3)
             
             def footer(self):
                 self.set_y(-15)
@@ -517,19 +511,49 @@ def create_summary_pdf(summary_text, nct_id, study_title=""):
         
         pdf = CustomPDF()
         pdf.add_page()
-        pdf.set_margins(15, 20, 15)
+        pdf.set_margins(15, 25, 15)  # Left, Top, Right margins
         
         # Add URL link
         pdf.set_font("Arial", 'U', 10)
         url_text = f"https://clinicaltrials.gov/study/{nct_id}"
         pdf.set_text_color(0, 0, 255)  # Blue
-        pdf.cell(0, 10, url_text, 0, 1, 'C', link=url_text)
+        pdf.cell(0, 8, url_text, 0, 1, 'C', link=url_text)
         pdf.set_text_color(0, 0, 0)  # Reset to black
-        pdf.ln(10)
+        pdf.ln(8)
 
         # Process summary content with improved formatting
         clean_summary = clean_text_for_pdf(summary_text)
         lines = clean_summary.split('\n')
+        
+        def write_wrapped_text(pdf, text, font_size=10, font_style='', indent=0):
+            """Helper function to properly wrap text to full page width"""
+            pdf.set_font("Arial", font_style, font_size)
+            
+            # Calculate available width considering margins and indent
+            page_width = pdf.w - 2 * pdf.l_margin - indent
+            
+            # Split text into words
+            words = text.split(' ')
+            current_line = ""
+            
+            for word in words:
+                # Test if adding this word would exceed the line width
+                test_line = current_line + (" " if current_line else "") + word
+                if pdf.get_string_width(test_line) < page_width:
+                    current_line = test_line
+                else:
+                    # Write the current line and start a new one
+                    if current_line:
+                        if indent > 0:
+                            pdf.cell(indent, 6, '', 0, 0)  # Add indentation
+                        pdf.cell(0, 6, current_line, 0, 1, 'L')
+                    current_line = word
+            
+            # Write the last line
+            if current_line:
+                if indent > 0:
+                    pdf.cell(indent, 6, '', 0, 0)  # Add indentation
+                pdf.cell(0, 6, current_line, 0, 1, 'L')
         
         for line in lines:
             try:
@@ -544,69 +568,54 @@ def create_summary_pdf(summary_text, nct_id, study_title=""):
                     pdf.set_font("Arial", 'B', 16)
                     pdf.set_text_color(0, 51, 102)  # Dark blue
                     header_text = clean_text_for_pdf(line.replace('# ', ''))
-                    pdf.cell(0, 12, header_text, 0, 1, 'L')
+                    write_wrapped_text(pdf, header_text, 16, 'B')
                     pdf.set_text_color(0, 0, 0)  # Reset to black
                     pdf.ln(3)
                 
                 # Section headers (## )
                 elif line.startswith('## '):
-                    pdf.ln(8)
+                    pdf.ln(6)
                     pdf.set_font("Arial", 'B', 14)
                     pdf.set_text_color(51, 102, 153)  # Medium blue
                     header_text = clean_text_for_pdf(line.replace('## ', ''))
-                    pdf.cell(0, 10, header_text, 0, 1, 'L')
+                    write_wrapped_text(pdf, header_text, 14, 'B')
                     pdf.set_text_color(0, 0, 0)  # Reset to black
                     pdf.ln(2)
                 
                 # Subsection headers (### )
                 elif line.startswith('### '):
-                    pdf.ln(5)
+                    pdf.ln(4)
                     pdf.set_font("Arial", 'B', 12)
                     pdf.set_text_color(102, 153, 204)  # Light blue
                     header_text = clean_text_for_pdf(line.replace('### ', ''))
-                    pdf.cell(0, 8, header_text, 0, 1, 'L')
+                    write_wrapped_text(pdf, header_text, 12, 'B')
                     pdf.set_text_color(0, 0, 0)  # Reset to black
                     pdf.ln(2)
                 
                 # Bold text (**text**)
                 elif '**' in line:
-                    pdf.set_font("Arial", 'B', 11)
                     bold_text = clean_text_for_pdf(line.replace('**', ''))
-                    pdf.cell(0, 7, bold_text, 0, 1, 'L')
-                    pdf.set_font("Arial", '', 10)
+                    write_wrapped_text(pdf, bold_text, 11, 'B')
                 
                 # Bullet points (• or -)
                 elif line.startswith('• ') or line.startswith('- '):
-                    pdf.set_font("Arial", '', 10)
                     bullet_text = clean_text_for_pdf(line)
-                    # Add indentation for bullet points
-                    pdf.cell(10, 6, '', 0, 0)  # Indent
-                    pdf.cell(0, 6, bullet_text, 0, 1, 'L')
+                    write_wrapped_text(pdf, bullet_text, 10, '', 8)  # 8 point indent
                 
-                # Table rows (|)
+                # Table rows (|) - handle tables differently
                 elif '|' in line and line.count('|') >= 2:
                     pdf.set_font("Arial", '', 9)
                     table_text = clean_text_for_pdf(line)
-                    pdf.cell(0, 6, table_text, 0, 1, 'L')
+                    # For tables, use smaller font and don't wrap to preserve structure
+                    if len(table_text) > 120:  # If table is too long, truncate
+                        table_text = table_text[:117] + "..."
+                    pdf.cell(0, 5, table_text, 0, 1, 'L')
                 
                 # Regular text
                 else:
-                    pdf.set_font("Arial", '', 10)
                     regular_text = clean_text_for_pdf(line)
-                    if len(regular_text) > 80:  # Wrap long lines
-                        words = regular_text.split(' ')
-                        current_line = ""
-                        for word in words:
-                            if len(current_line + word) < 80:
-                                current_line += word + " "
-                            else:
-                                if current_line:
-                                    pdf.cell(0, 6, current_line.strip(), 0, 1, 'L')
-                                current_line = word + " "
-                        if current_line:
-                            pdf.cell(0, 6, current_line.strip(), 0, 1, 'L')
-                    else:
-                        pdf.cell(0, 6, regular_text, 0, 1, 'L')
+                    if regular_text.strip():  # Only process non-empty lines
+                        write_wrapped_text(pdf, regular_text, 10, '')
                 
             except Exception as e:
                 # Skip problematic lines and continue
@@ -689,8 +698,7 @@ if hasattr(st.session_state, 'current_summary') and st.session_state.current_sum
     try:
         pdf_data = create_summary_pdf(
             st.session_state.current_summary, 
-            st.session_state.current_nct_id,
-            st.session_state.current_study_title
+            st.session_state.current_nct_id
         )
         st.sidebar.download_button(
             label="📄 PDF Download",
@@ -704,7 +712,6 @@ if hasattr(st.session_state, 'current_summary') and st.session_state.current_sum
     
     # Text Download
     text_summary = f"Clinical Trial Summary: {st.session_state.current_nct_id}\n"
-    text_summary += f"{st.session_state.current_study_title}\n\n"
     text_summary += f"URL: https://clinicaltrials.gov/study/{st.session_state.current_nct_id}\n\n"
     text_summary += st.session_state.current_summary
     
@@ -828,7 +835,7 @@ if url_input and nct_match and not st.session_state.messages:
         
         with col1:
             try:
-                pdf_data = create_summary_pdf(full_summary, nct_id, st.session_state.current_study_title)
+                pdf_data = create_summary_pdf(full_summary, nct_id)
                 st.download_button(
                     label="📄 Download PDF",
                     data=pdf_data,
@@ -842,7 +849,6 @@ if url_input and nct_match and not st.session_state.messages:
         with col2:
             # Provide text download as backup
             text_summary = f"Clinical Trial Summary: {nct_id}\n"
-            text_summary += f"{st.session_state.current_study_title}\n\n"
             text_summary += f"URL: https://clinicaltrials.gov/study/{nct_id}\n\n"
             text_summary += full_summary
             
