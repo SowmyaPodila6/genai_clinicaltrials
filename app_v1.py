@@ -1016,7 +1016,7 @@ if url_input and nct_match and not st.session_state.messages:
 [Create a simple table if multiple arms exist, otherwise describe briefly]
 
 ### Eligibility Criteria
-[Key inclusion criteria in 1-2 sentences]
+[Key inclusion criteria and exclusion criteria in 1-2 sentences]
 
 ### Enrollment & Participant Flow
 [Patient numbers and enrollment status if available]
@@ -1034,6 +1034,7 @@ if url_input and nct_match and not st.session_state.messages:
 - Use the study title as the secondary heading
 - Use clear section headers (###)
 - Keep each section to 1-3 sentences or a simple table
+- Do not skip any key details if available; do not fabricate missing info; strictly summarize the content from the Protocol.
 - Use bullet points for lists
 - Only include sections where meaningful data exists
 - Skip any section that says "not available" or has insufficient information
