@@ -103,7 +103,11 @@ def get_protocol_data(nct_number):
 
         # Eligibility Module
         eligibility_module = protocol_section.get('eligibilityModule', {})
-        eligibility_criteria = eligibility_module.get('eligibilityCriteria', {}).get('textblock', 'N/A')
+        eligibility_criteria_data = eligibility_module.get('eligibilityCriteria', 'N/A')
+        if isinstance(eligibility_criteria_data, dict):
+            eligibility_criteria = eligibility_criteria_data.get('textblock', 'N/A')
+        else:
+            eligibility_criteria = eligibility_criteria_data
         
         # Outcomes Module
         outcomes_module = protocol_section.get('outcomesModule', {})
