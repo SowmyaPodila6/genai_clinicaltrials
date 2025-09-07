@@ -474,7 +474,7 @@ def summarize_with_gpt4o(messages):
     except Exception as e:
         return None, f"An unexpected error occurred during summarization: {e}"
 
-def create_summary_pdf(summary_text, nct_id):
+def create_summary_pdf(summary_text, nct_id, study_title=""):
     try:
         from fpdf import FPDF
         import unicodedata
@@ -495,54 +495,119 @@ def create_summary_pdf(summary_text, nct_id):
                 ascii_text = normalized.encode('ascii', 'ignore').decode('ascii')
                 return ascii_text
         
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", size=12)
-        pdf.set_margins(10, 10, 10)
+        class CustomPDF(FPDF):
+            def header(self):
+                # Set header with study info
+                self.set_font('Arial', 'B', 12)
+                self.set_text_color(0, 51, 102)  # Dark blue
+                self.cell(0, 10, f'Clinical Trial Summary: {nct_id}', 0, 1, 'C')
+                if study_title:
+                    self.set_font('Arial', '', 10)
+                    self.set_text_color(0, 0, 0)  # Black
+                    # Truncate title if too long
+                    display_title = study_title[:80] + "..." if len(study_title) > 80 else study_title
+                    self.cell(0, 8, display_title, 0, 1, 'C')
+                self.ln(5)
+            
+            def footer(self):
+                self.set_y(-15)
+                self.set_font('Arial', 'I', 8)
+                self.set_text_color(128, 128, 128)  # Gray
+                self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
         
-        # Add Title
-        pdf.set_font("Arial", 'B', 16)
-        title_text = clean_text_for_pdf(f"Clinical Protocol Summary for NCT ID: {nct_id}")
-        pdf.cell(200, 10, txt=title_text, ln=True, align='C')
-        pdf.ln(5)
-
-        # Add URL
+        pdf = CustomPDF()
+        pdf.add_page()
+        pdf.set_margins(15, 20, 15)
+        
+        # Add URL link
         pdf.set_font("Arial", 'U', 10)
         url_text = f"https://clinicaltrials.gov/study/{nct_id}"
-        pdf.set_text_color(0, 0, 255) # Blue
-        pdf.cell(0, 10, url_text, 0, 1, 'L', link=url_text)
-        pdf.set_text_color(0, 0, 0) # Black
-        pdf.ln(5)
+        pdf.set_text_color(0, 0, 255)  # Blue
+        pdf.cell(0, 10, url_text, 0, 1, 'C', link=url_text)
+        pdf.set_text_color(0, 0, 0)  # Reset to black
+        pdf.ln(10)
 
-        # Add Summary Content
-        pdf.set_font("Arial", size=12)
-        
-        # Clean the summary text first
+        # Process summary content with improved formatting
         clean_summary = clean_text_for_pdf(summary_text)
-        
-        # Handle markdown-style headers and bold text
         lines = clean_summary.split('\n')
+        
         for line in lines:
             try:
-                if line.startswith('### **'):
-                    pdf.set_font("Arial", 'B', 14)
-                    header_text = clean_text_for_pdf(line.replace('### **', '').replace('**', ''))
-                    if len(header_text) > 50:  # Truncate very long headers
-                        header_text = header_text[:47] + "..."
-                    pdf.cell(0, 10, header_text, ln=True)
-                    pdf.set_font("Arial", '', 12)
-                elif line.startswith('**'):
-                    pdf.set_font("Arial", 'B', 12)
-                    bold_text = clean_text_for_pdf(line.replace('**', '') + " ")
-                    pdf.write(5, bold_text)
-                    pdf.set_font("Arial", '', 12)
-                else:
-                    line_text = clean_text_for_pdf(line)
-                    if line_text.strip():  # Only write non-empty lines
-                        pdf.write(5, line_text)
+                line = line.strip()
+                if not line:
+                    pdf.ln(3)  # Small spacing for empty lines
+                    continue
                 
-                if line.strip() == "":
+                # Main headers (# )
+                if line.startswith('# '):
                     pdf.ln(5)
+                    pdf.set_font("Arial", 'B', 16)
+                    pdf.set_text_color(0, 51, 102)  # Dark blue
+                    header_text = clean_text_for_pdf(line.replace('# ', ''))
+                    pdf.cell(0, 12, header_text, 0, 1, 'L')
+                    pdf.set_text_color(0, 0, 0)  # Reset to black
+                    pdf.ln(3)
+                
+                # Section headers (## )
+                elif line.startswith('## '):
+                    pdf.ln(8)
+                    pdf.set_font("Arial", 'B', 14)
+                    pdf.set_text_color(51, 102, 153)  # Medium blue
+                    header_text = clean_text_for_pdf(line.replace('## ', ''))
+                    pdf.cell(0, 10, header_text, 0, 1, 'L')
+                    pdf.set_text_color(0, 0, 0)  # Reset to black
+                    pdf.ln(2)
+                
+                # Subsection headers (### )
+                elif line.startswith('### '):
+                    pdf.ln(5)
+                    pdf.set_font("Arial", 'B', 12)
+                    pdf.set_text_color(102, 153, 204)  # Light blue
+                    header_text = clean_text_for_pdf(line.replace('### ', ''))
+                    pdf.cell(0, 8, header_text, 0, 1, 'L')
+                    pdf.set_text_color(0, 0, 0)  # Reset to black
+                    pdf.ln(2)
+                
+                # Bold text (**text**)
+                elif '**' in line:
+                    pdf.set_font("Arial", 'B', 11)
+                    bold_text = clean_text_for_pdf(line.replace('**', ''))
+                    pdf.cell(0, 7, bold_text, 0, 1, 'L')
+                    pdf.set_font("Arial", '', 10)
+                
+                # Bullet points (• or -)
+                elif line.startswith('• ') or line.startswith('- '):
+                    pdf.set_font("Arial", '', 10)
+                    bullet_text = clean_text_for_pdf(line)
+                    # Add indentation for bullet points
+                    pdf.cell(10, 6, '', 0, 0)  # Indent
+                    pdf.cell(0, 6, bullet_text, 0, 1, 'L')
+                
+                # Table rows (|)
+                elif '|' in line and line.count('|') >= 2:
+                    pdf.set_font("Arial", '', 9)
+                    table_text = clean_text_for_pdf(line)
+                    pdf.cell(0, 6, table_text, 0, 1, 'L')
+                
+                # Regular text
+                else:
+                    pdf.set_font("Arial", '', 10)
+                    regular_text = clean_text_for_pdf(line)
+                    if len(regular_text) > 80:  # Wrap long lines
+                        words = regular_text.split(' ')
+                        current_line = ""
+                        for word in words:
+                            if len(current_line + word) < 80:
+                                current_line += word + " "
+                            else:
+                                if current_line:
+                                    pdf.cell(0, 6, current_line.strip(), 0, 1, 'L')
+                                current_line = word + " "
+                        if current_line:
+                            pdf.cell(0, 6, current_line.strip(), 0, 1, 'L')
+                    else:
+                        pdf.cell(0, 6, regular_text, 0, 1, 'L')
+                
             except Exception as e:
                 # Skip problematic lines and continue
                 continue
@@ -569,6 +634,7 @@ def new_chat_click():
     st.session_state.messages = []
     st.session_state.current_convo_id = str(uuid.uuid4())
     st.session_state.url_key = str(uuid.uuid4())
+    # Don't clear summary data - let users access previous summaries
     st.rerun()
 
 st.title("Gen AI-Powered Clinical Protocol Summarizer")
@@ -580,6 +646,24 @@ for convo_id in conversations:
     if st.sidebar.button(convo_id, key=convo_id):
         st.session_state.messages = load_messages_from_db(convo_id)
         st.session_state.current_convo_id = convo_id
+        
+        # Check if this conversation has a summary and restore download capability
+        for msg in st.session_state.messages:
+            if msg["role"] == "assistant" and ("Clinical Trial Summary:" in msg["content"] or "# Clinical Trial Summary" in msg["content"]):
+                # Try to extract NCT ID from the content
+                import re
+                nct_match = re.search(r"NCT\d{8}", msg["content"])
+                if nct_match:
+                    st.session_state.current_summary = msg["content"]
+                    st.session_state.current_nct_id = nct_match.group(0)
+                    # Try to extract title from the summary
+                    title_match = re.search(r"##\s*(.+)", msg["content"])
+                    if title_match:
+                        st.session_state.current_study_title = title_match.group(1).strip()
+                    else:
+                        st.session_state.current_study_title = ""
+                break
+        
         st.rerun()
 
 st.sidebar.button("Start New Chat", key="new_chat_button", on_click=new_chat_click)
@@ -595,6 +679,45 @@ if "current_convo_id" not in st.session_state:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+
+# Show persistent download options if a summary exists in this conversation
+if hasattr(st.session_state, 'current_summary') and st.session_state.current_summary:
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📥 Download Current Summary")
+    
+    # PDF Download
+    try:
+        pdf_data = create_summary_pdf(
+            st.session_state.current_summary, 
+            st.session_state.current_nct_id,
+            st.session_state.current_study_title
+        )
+        st.sidebar.download_button(
+            label="📄 PDF Download",
+            data=pdf_data,
+            file_name=f"clinical_trial_summary_{st.session_state.current_nct_id}.pdf",
+            mime="application/pdf",
+            key="sidebar_pdf_download"
+        )
+    except Exception as e:
+        st.sidebar.error("PDF generation error")
+    
+    # Text Download
+    text_summary = f"Clinical Trial Summary: {st.session_state.current_nct_id}\n"
+    text_summary += f"{st.session_state.current_study_title}\n\n"
+    text_summary += f"URL: https://clinicaltrials.gov/study/{st.session_state.current_nct_id}\n\n"
+    text_summary += st.session_state.current_summary
+    
+    st.sidebar.download_button(
+        label="📝 Text Download",
+        data=text_summary.encode('utf-8'),
+        file_name=f"clinical_trial_summary_{st.session_state.current_nct_id}.txt",
+        mime="text/plain",
+        key="sidebar_text_download"
+    )
+    
+    if st.session_state.current_nct_id and st.session_state.current_nct_id != 'N/A':
+        st.sidebar.markdown(f"**<a href='https://clinicaltrials.gov/study/{st.session_state.current_nct_id}' target='_blank'>🔗 View on ClinicalTrials.gov</a>**", unsafe_allow_html=True)
 
 # Handle the initial URL input
 url_input = st.text_input("ClinicalTrials.gov URL:", placeholder="e.g., https://clinicaltrials.gov/study/NCT01234567", key=st.session_state.url_key)
@@ -639,24 +762,25 @@ if url_input and nct_match and not st.session_state.messages:
             
             concise_prompt = f"""Generate a concise, well-formatted clinical trial summary using ONLY the information provided below. Follow this structure and format:
 
-# Clinical Trial Summary
+# Clinical Trial Summary: {nct_id}
+## {data_to_summarize.get('Study Overview', '').split('|')[0].strip() if data_to_summarize.get('Study Overview') else 'Clinical Trial Protocol'}
 
-## Study Overview
-[Extract title, phase, design, and brief description - 2-3 sentences max]
+### Study Overview
+[Extract phase, design, and brief description - 2-3 sentences max]
 
-## Primary Objectives
+### Primary Objectives
 [List main safety and/or efficacy endpoints - bullet points, be specific]
 
-## Treatment Arms & Interventions
+### Treatment Arms & Interventions
 [Create a simple table if multiple arms exist, otherwise describe briefly]
 
-## Eligibility Criteria
+### Eligibility Criteria
 [Key inclusion criteria in 1-2 sentences]
 
-## Enrollment & Participant Flow
+### Enrollment & Participant Flow
 [Patient numbers and enrollment status if available]
 
-## Safety Profile
+### Safety Profile
 [Only include if adverse events data is available - summarize key findings]
 
 ---
@@ -665,7 +789,8 @@ if url_input and nct_match and not st.session_state.messages:
 {consolidated_content}
 
 **Formatting Requirements:**
-- Use clear section headers (##)
+- Start with the NCT ID and study title as shown above
+- Use clear section headers (###)
 - Keep each section to 1-3 sentences or a simple table
 - Use bullet points for lists
 - Only include sections where meaningful data exists
@@ -690,40 +815,48 @@ if url_input and nct_match and not st.session_state.messages:
         with st.chat_message("assistant"):
             st.markdown(full_summary)
         
-        # Provide both PDF and text download options
-        col1, col2 = st.columns(2)
+        # Store summary and NCT info in session state for persistent downloads
+        st.session_state.current_summary = full_summary
+        st.session_state.current_nct_id = nct_id
+        st.session_state.current_study_title = data_to_summarize.get("Study Overview", "").split("|")[0].strip() if data_to_summarize.get("Study Overview") else ""
+        
+        save_message_to_db(st.session_state.current_convo_id, "assistant", full_summary)
+        
+        # Provide immediate download options after summary generation
+        st.markdown("---")
+        col1, col2, col3 = st.columns(3)
         
         with col1:
             try:
-                pdf_data = create_summary_pdf(full_summary, nct_id)
+                pdf_data = create_summary_pdf(full_summary, nct_id, st.session_state.current_study_title)
                 st.download_button(
-                    label="📄 Download Summary as PDF",
+                    label="📄 Download PDF",
                     data=pdf_data,
                     file_name=f"clinical_trial_summary_{nct_id}.pdf",
-                    mime="application/pdf"
+                    mime="application/pdf",
+                    key="main_pdf_download"
                 )
             except Exception as e:
                 st.error(f"PDF generation failed: {str(e)}")
         
         with col2:
             # Provide text download as backup
-            text_summary = f"Clinical Protocol Summary for NCT ID: {nct_id}\n"
+            text_summary = f"Clinical Trial Summary: {nct_id}\n"
+            text_summary += f"{st.session_state.current_study_title}\n\n"
             text_summary += f"URL: https://clinicaltrials.gov/study/{nct_id}\n\n"
             text_summary += full_summary
             
             st.download_button(
-                label="📝 Download Summary as Text",
+                label="📝 Download Text",
                 data=text_summary.encode('utf-8'),
                 file_name=f"clinical_trial_summary_{nct_id}.txt",
-                mime="text/plain"
+                mime="text/plain",
+                key="main_text_download"
             )
         
-        if nct_id and nct_id != 'N/A':
-            st.markdown(f"**<a href='https://clinicaltrials.gov/study/{nct_id}' target='_blank'>View Full Protocol on ClinicalTrials.gov</a>**", unsafe_allow_html=True)
-        else:
-            st.markdown("Could not generate a link to the full protocol.")
-        
-        save_message_to_db(st.session_state.current_convo_id, "assistant", full_summary)
+        with col3:
+            if nct_id and nct_id != 'N/A':
+                st.markdown(f"**<a href='https://clinicaltrials.gov/study/{nct_id}' target='_blank'>🔗 View Full Protocol</a>**", unsafe_allow_html=True)
             
 # Handle follow-up chat input
 if prompt := st.chat_input("Ask a follow-up question about the study..."):
