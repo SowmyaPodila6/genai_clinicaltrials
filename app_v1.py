@@ -1,3 +1,4 @@
+
 import streamlit as st
 import openai
 import requests
@@ -6,6 +7,44 @@ import os
 import sqlite3
 import uuid
 from fpdf import FPDF
+
+# --- Mock Summary Template ---
+mock_summary_template = """
+Below is an example of a desired summary format for a clinical trial protocol:
+
+1. Summary
+Title: A Phase 1/2 Study of Agent X (NSC ######) in Combination with Agent Y in Patients with Advanced Non-Small Cell Lung Cancer (NSCLC)
+Design: Phase 1 - Dose-escalation; Phase 2 - Expansion to assess efficacy.
+Primary Objective (Phase 1): Determine MTD and recommended Phase 2 dose (RP2D).
+Primary Objective (Phase 2): Objective response rate (ORR) per RECIST v1.1.
+Secondary Objectives: PFS, OS, safety, symptom relief, biomarker analysis.
+Eligibility: Adults 18 and older, ECOG 0-1, measurable disease, archival & fresh biopsy optional/required.
+
+2. Historical Submissions with Similar Drugs
+(Note: This information is not always available in the standard ClinicalTrials.gov JSON. Please state if no such data can be found.)
+Protocol ID | Agents Studied | Disease | Phase | Outcome
+NCI-2021-101 | Agent X (mono) | Colorectal | 1 | Grade 3 diarrhea at 100 mg/m2
+... (provide a table if historical data exists in the provided JSON)
+
+3. Potential Adverse Events
+System | Common AEs | Serious AEs
+GI | Nausea, diarrhea | Colitis, perforation
+Hematologic | Anemia, neutropenia | Febrile neutropenia
+... (provide a table based on the provided JSON data)
+
+4. Treatment Plan Overview
+Phase 1 Arms:
+Arm | Dose Level | Agent X (mg/m2) | Agent Y (mg) | Patients
+A | DL1 | 50 | 100 | 3-6
+... (provide a table based on the provided JSON data)
+Phase 2 Expansion:
+Arm | Agent X | Agent Y | Patients | Objective
+1 | 75 mg/m2 | 200 mg | 25 | ORR
+... (provide a table based on the provided JSON data)
+
+Please use the provided JSON data from a clinical trial to generate a summary that follows this exact format.
+Extract the relevant information and fill in the sections.
+"""
 
 # Set up the OpenAI API key from Streamlit secrets
 openai.api_key = st.secrets["OPENAI_API_KEY"]
@@ -89,20 +128,91 @@ def get_protocol_data(nct_number):
         # Design Module
         design_module = protocol_section.get('designModule', {})
         study_type = design_module.get('studyType', 'N/A')
-        study_design = design_module.get('designInfo', {}).get('interventionModel', 'N/A')
-        study_phase = ", ".join(design_module.get('phases', ['N/A']))
+        study_phases = design_module.get('phases', [])
+        study_phase = ", ".join(study_phases) if study_phases else 'N/A'
+        
+        design_info = design_module.get('designInfo', {})
+        allocation = design_info.get('allocation', 'N/A')
+        intervention_model = design_info.get('interventionModel', 'N/A')
+        primary_purpose = design_info.get('primaryPurpose', 'N/A')
+        
+        masking_info = design_info.get('maskingInfo', {})
+        masking = masking_info.get('masking', 'N/A')
+        who_masked = masking_info.get('whoMasked', [])
+        who_masked_str = ", ".join(who_masked) if who_masked else 'N/A'
+        
+        enrollment_info = design_module.get('enrollmentInfo', {})
+        enrollment_count = enrollment_info.get('count', 'N/A')
+        enrollment_type = enrollment_info.get('type', 'N/A')
+        
+        study_design_text = f"Study Type: {study_type}\nPhases: {study_phase}\nAllocation: {allocation}\nIntervention Model: {intervention_model}\nPrimary Purpose: {primary_purpose}\nMasking: {masking}\nWho Masked: {who_masked_str}\nEnrollment: {enrollment_count} ({enrollment_type})"
         
         # Interventions and Arm Groups
         arms_interventions_module = protocol_section.get('armsInterventionsModule', {})
         arm_groups_list = arms_interventions_module.get('armGroups', [])
         if not isinstance(arm_groups_list, list):
             arm_groups_list = []
-        arm_groups_text = "\n".join([f"- ID: {ag.get('armGroupId', 'N/A')}\n  Title: {ag.get('armGroupLabel', 'N/A')}\n  Description: {ag.get('armGroupDescription', 'N/A')}" for ag in arm_groups_list])
         
+        # Extract arm groups with enhanced dosing information
+        arm_groups_text = ""
+        for i, ag in enumerate(arm_groups_list, 1):
+            arm_label = ag.get('label', f'Arm {i}')
+            arm_type = ag.get('type', 'N/A')
+            arm_description = ag.get('description', 'N/A')
+            intervention_names = ag.get('interventionNames', [])
+            intervention_names_str = ", ".join(intervention_names) if intervention_names else "N/A"
+            
+            # Try to extract dose information from description
+            dose_info = ""
+            if arm_description and arm_description != 'N/A':
+                # Look for common dose patterns
+                dose_patterns = [
+                    r'(\d+(?:\.\d+)?)\s*mg/kg',  # mg/kg dosing
+                    r'(\d+(?:\.\d+)?)\s*mg/m2',  # mg/m2 dosing  
+                    r'(\d+(?:\.\d+)?)\s*mg',     # mg dosing
+                    r'(\d+(?:\.\d+)?)\s*mcg',    # mcg dosing
+                    r'(\d+(?:\.\d+)?)\s*units',  # units
+                ]
+                
+                found_doses = []
+                for pattern in dose_patterns:
+                    matches = re.findall(pattern, arm_description, re.IGNORECASE)
+                    if matches:
+                        unit = pattern.split('\\s*')[1].replace(')', '')
+                        for match in matches:
+                            found_doses.append(f"{match} {unit}")
+                
+                if found_doses:
+                    dose_info = f"  Doses: {', '.join(found_doses)}\n"
+            
+            arm_groups_text += f"**Arm {i}: {arm_label}**\n  Type: {arm_type}\n  Description: {arm_description}\n{dose_info}  Interventions: {intervention_names_str}\n\n"
+        
+        # Extract interventions with correct field names
         interventions_list = arms_interventions_module.get('interventions', [])
         if not isinstance(interventions_list, list):
             interventions_list = []
-        interventions_text = "\n".join([f"- Name: {i.get('interventionName', 'N/A')}\n  Type: {i.get('interventionType', 'N/A')}" for i in interventions_list])
+        
+        # Extract interventions with enhanced drug information
+        interventions_text = ""
+        for i, intervention in enumerate(interventions_list, 1):
+            name = intervention.get('name', 'N/A')
+            int_type = intervention.get('type', 'N/A')
+            description = intervention.get('description', 'N/A')
+            arm_group_labels = intervention.get('armGroupLabels', [])
+            other_names = intervention.get('otherNames', [])
+            
+            arm_labels_str = ", ".join(arm_group_labels) if arm_group_labels else "N/A"
+            other_names_str = ", ".join(other_names) if other_names else "N/A"
+            
+            # Extract drug class or mechanism information from other names
+            drug_info = ""
+            if other_names:
+                for other_name in other_names:
+                    if any(keyword in other_name.upper() for keyword in ['ANTI-', 'INHIBITOR', 'AGONIST', 'ANTAGONIST']):
+                        drug_info = f"  Mechanism: {other_name}\n"
+                        break
+            
+            interventions_text += f"**Drug {i}: {name}**\n  Type: {int_type}\n  Description: {description}\n{drug_info}  Used in Arms: {arm_labels_str}\n  Other Names/Codes: {other_names_str}\n\n"
 
         # Eligibility Module
         eligibility_module = protocol_section.get('eligibilityModule', {})
@@ -112,12 +222,65 @@ def get_protocol_data(nct_number):
         else:
             eligibility_criteria = eligibility_criteria_data
         
-        # Outcomes Module
+        # Enhanced outcomes extraction with objective identification
         outcomes_module = protocol_section.get('outcomesModule', {})
-        outcomes_list = outcomes_module.get('primaryOutcomes', []) + outcomes_module.get('secondaryOutcomes', [])
-        outcomes_text = "\n".join([f"- Measure: {o.get('outcomeMeasure', 'N/A')}\n  Description: {o.get('outcomeDescription', 'N/A')}" for o in outcomes_list])
+        primary_outcomes = outcomes_module.get('primaryOutcomes', [])
+        secondary_outcomes = outcomes_module.get('secondaryOutcomes', [])
+        
+        outcomes_text = ""
+        
+        # Extract and categorize primary outcomes
+        if primary_outcomes:
+            safety_outcomes = []
+            efficacy_outcomes = []
+            pk_outcomes = []
+            
+            for outcome in primary_outcomes:
+                measure = outcome.get('measure', 'N/A')
+                description = outcome.get('description', 'N/A')
+                time_frame = outcome.get('timeFrame', 'N/A')
+                
+                # Categorize outcomes based on keywords
+                measure_lower = measure.lower()
+                if any(keyword in measure_lower for keyword in ['safety', 'adverse', 'toxicity', 'mtd', 'dose']):
+                    safety_outcomes.append({'measure': measure, 'description': description, 'time_frame': time_frame})
+                elif any(keyword in measure_lower for keyword in ['response', 'efficacy', 'survival', 'progression']):
+                    efficacy_outcomes.append({'measure': measure, 'description': description, 'time_frame': time_frame})
+                elif any(keyword in measure_lower for keyword in ['pharmacokinetic', 'concentration', 'clearance']):
+                    pk_outcomes.append({'measure': measure, 'description': description, 'time_frame': time_frame})
+                else:
+                    efficacy_outcomes.append({'measure': measure, 'description': description, 'time_frame': time_frame})
+            
+            outcomes_text += "**Primary Objectives:**\n"
+            
+            if safety_outcomes:
+                outcomes_text += "\n*Safety Objectives:*\n"
+                for outcome in safety_outcomes:
+                    outcomes_text += f"- {outcome['measure']}\n  Description: {outcome['description']}\n  Time Frame: {outcome['time_frame']}\n\n"
+            
+            if efficacy_outcomes:
+                outcomes_text += "\n*Efficacy Objectives:*\n"
+                for outcome in efficacy_outcomes:
+                    outcomes_text += f"- {outcome['measure']}\n  Description: {outcome['description']}\n  Time Frame: {outcome['time_frame']}\n\n"
+            
+            if pk_outcomes:
+                outcomes_text += "\n*Pharmacokinetic Objectives:*\n"
+                for outcome in pk_outcomes:
+                    outcomes_text += f"- {outcome['measure']}\n  Description: {outcome['description']}\n  Time Frame: {outcome['time_frame']}\n\n"
+        
+        # Extract secondary outcomes
+        if secondary_outcomes:
+            outcomes_text += "**Secondary Objectives:**\n"
+            for i, outcome in enumerate(secondary_outcomes[:10], 1):  # Limit to first 10
+                measure = outcome.get('measure', 'N/A')
+                description = outcome.get('description', 'N/A')
+                time_frame = outcome.get('timeFrame', 'N/A')
+                outcomes_text += f"{i}. {measure}\n   Description: {description}\n   Time Frame: {time_frame}\n\n"
+            
+            if len(secondary_outcomes) > 10:
+                outcomes_text += f"... and {len(secondary_outcomes)-10} additional secondary outcomes\n"
 
-        # Adverse Events (from resultsSection)
+        # Enhanced adverse events extraction grouped by organ system
         adverse_events_module = results_section.get('adverseEventsModule', {})
         serious_events = adverse_events_module.get('seriousEvents', [])
         if not isinstance(serious_events, list):
@@ -129,34 +292,179 @@ def get_protocol_data(nct_number):
         adverse_events_text = ""
         if serious_events or other_events:
             if serious_events:
-                adverse_events_text += "\n**Serious Adverse Events:**\n"
+                # Group serious events by organ system
+                serious_by_system = {}
                 for event in serious_events:
-                    term = event.get('adverseEventTerm', 'N/A')
-                    organ_system = event.get('adverseEventOrganSystem', 'N/A')
-                    adverse_events_text += f"- Term: {term}, Organ System: {organ_system}\n"
+                    term = event.get('term', 'N/A')
+                    organ_system = event.get('organSystem', 'Other')
+                    stats = event.get('stats', [])
+                    total_affected = sum(stat.get('numAffected', 0) for stat in stats if isinstance(stat, dict))
+                    total_at_risk = sum(stat.get('numAtRisk', 0) for stat in stats if isinstance(stat, dict))
+                    
+                    if organ_system not in serious_by_system:
+                        serious_by_system[organ_system] = []
+                    serious_by_system[organ_system].append(f"{term} ({total_affected}/{total_at_risk})")
+                
+                adverse_events_text += "\n**Serious Adverse Events by System:**\n"
+                for system, events in serious_by_system.items():
+                    adverse_events_text += f"\n**{system}:**\n"
+                    for event in events[:5]:  # Limit to top 5 per system
+                        adverse_events_text += f"- {event}\n"
+                    if len(events) > 5:
+                        adverse_events_text += f"- ... and {len(events)-5} more\n"
+            
             if other_events:
-                adverse_events_text += "\n**Other Adverse Events:**\n"
+                # Group common events by organ system (top 3 per system)
+                common_by_system = {}
                 for event in other_events:
-                    term = event.get('adverseEventTerm', 'N/A')
-                    organ_system = event.get('adverseEventOrganSystem', 'N/A')
-                    adverse_events_text += f"- Term: {term}, Organ System: {organ_system}\n"
+                    term = event.get('term', 'N/A')
+                    organ_system = event.get('organSystem', 'Other')
+                    stats = event.get('stats', [])
+                    total_affected = sum(stat.get('numAffected', 0) for stat in stats if isinstance(stat, dict))
+                    total_at_risk = sum(stat.get('numAtRisk', 0) for stat in stats if isinstance(stat, dict))
+                    
+                    # Only include events affecting > 5% of patients
+                    if total_at_risk > 0 and (total_affected / total_at_risk) > 0.05:
+                        if organ_system not in common_by_system:
+                            common_by_system[organ_system] = []
+                        common_by_system[organ_system].append({
+                            'term': term,
+                            'affected': total_affected,
+                            'at_risk': total_at_risk,
+                            'rate': total_affected / total_at_risk
+                        })
+                
+                # Sort by rate and take top events per system
+                for system in common_by_system:
+                    common_by_system[system].sort(key=lambda x: x['rate'], reverse=True)
+                    common_by_system[system] = common_by_system[system][:3]
+                
+                if common_by_system:
+                    adverse_events_text += "\n**Common Adverse Events by System (>5% incidence):**\n"
+                    for system, events in common_by_system.items():
+                        if events:  # Only show systems with events
+                            adverse_events_text += f"\n**{system}:**\n"
+                            for event in events:
+                                rate_pct = event['rate'] * 100
+                                adverse_events_text += f"- {event['term']}: {event['affected']}/{event['at_risk']} ({rate_pct:.1f}%)\n"
         else:
             adverse_events_text = "No adverse events reported in the structured API data."
+
+        # Extract participant flow data for patient numbers
+        participant_flow_text = ""
+        if results_section:
+            participant_flow_module = results_section.get('participantFlowModule', {})
+            groups = participant_flow_module.get('groups', [])
+            if groups:
+                participant_flow_text += "**Participant Enrollment by Group:**\n"
+                for group in groups:
+                    group_title = group.get('title', 'N/A')
+                    group_description = group.get('description', 'N/A')
+                    participant_flow_text += f"- {group_title}: {group_description}\n"
+                
+                periods = participant_flow_module.get('periods', [])
+                if periods:
+                    for period in periods:
+                        milestones = period.get('milestones', [])
+                        for milestone in milestones:
+                            if milestone.get('type') == 'STARTED':
+                                participant_flow_text += "\n**Enrollment Numbers:**\n"
+                                achievements = milestone.get('achievements', [])
+                                for achievement in achievements:
+                                    group_id = achievement.get('groupId', 'N/A')
+                                    num_subjects = achievement.get('numSubjects', 'N/A')
+                                    # Find corresponding group title
+                                    group_title = next((g.get('title', 'N/A') for g in groups if g.get('id') == group_id), group_id)
+                                    participant_flow_text += f"- {group_title}: {num_subjects} patients\n"
+                                break
+                        break
+        
+        # Extract sponsor and collaborator information
+        sponsor_collaborators_module = protocol_section.get('sponsorCollaboratorsModule', {})
+        lead_sponsor = sponsor_collaborators_module.get('leadSponsor', {})
+        sponsor_name = lead_sponsor.get('name', 'N/A')
+        sponsor_class = lead_sponsor.get('class', 'N/A')
+        
+        collaborators = sponsor_collaborators_module.get('collaborators', [])
+        collaborator_text = ""
+        if collaborators:
+            collaborator_names = [collab.get('name', 'N/A') for collab in collaborators]
+            collaborator_text = f"Collaborators: {', '.join(collaborator_names)}"
+        
+        sponsor_info = f"Lead Sponsor: {sponsor_name} ({sponsor_class})\n{collaborator_text}"
+        
+        # Extract contacts and locations for site information
+        contacts_locations_module = protocol_section.get('contactsLocationsModule', {})
+        locations = contacts_locations_module.get('locations', [])
+        location_text = ""
+        if locations:
+            location_text += f"**Study Locations ({len(locations)} sites):**\n"
+            # Group by country
+            countries = {}
+            for location in locations:
+                country = location.get('country', 'Unknown')
+                city = location.get('city', 'N/A')
+                facility = location.get('facility', 'N/A')
+                if country not in countries:
+                    countries[country] = []
+                countries[country].append(f"{facility}, {city}")
+            
+            for country, sites in countries.items():
+                location_text += f"- {country}: {len(sites)} sites\n"
+                # Show first few sites as examples
+                for site in sites[:3]:
+                    location_text += f"  • {site}\n"
+                if len(sites) > 3:
+                    location_text += f"  • ... and {len(sites)-3} more sites\n"
+        
+        # Extract additional eligibility details
+        eligibility_module = protocol_section.get('eligibilityModule', {})
+        min_age = eligibility_module.get('minimumAge', 'N/A')
+        max_age = eligibility_module.get('maximumAge', 'N/A')
+        sex = eligibility_module.get('sex', 'N/A')
+        healthy_volunteers = eligibility_module.get('healthyVolunteers', False)
+        std_ages = eligibility_module.get('stdAges', [])
+        
+        eligibility_summary = f"Age: {min_age}"
+        if max_age and max_age != 'N/A':
+            eligibility_summary += f" to {max_age}"
+        eligibility_summary += f"\nSex: {sex}\nHealthy Volunteers: {'Yes' if healthy_volunteers else 'No'}"
+        if std_ages:
+            eligibility_summary += f"\nAge Groups: {', '.join(std_ages)}"
+        
+        # Extract conditions/diseases studied
+        conditions_module = protocol_section.get('conditionsModule', {})
+        conditions = conditions_module.get('conditions', [])
+        keywords = conditions_module.get('keywords', [])
+        
+        conditions_text = ""
+        if conditions:
+            conditions_text += f"Conditions: {', '.join(conditions)}\n"
+        if keywords:
+            conditions_text += f"Keywords: {', '.join(keywords)}"
+        
+        # Historical submissions note
+        historical_note = "Historical Submissions with Similar Drugs: This information is not available in the standard ClinicalTrials.gov JSON data structure."
 
         # Structured data for section-wise summarization
         data_to_summarize = {
             "Official Title": official_title,
             "Overall Status": overall_status,
-            "Study Type": study_type,
-            "Study Design": study_design,
-            "Study Phase": study_phase,
+            "Study Type and Phase": f"{study_type} - {study_phase}",
+            "Study Design Details": study_design_text,
+            "Conditions and Keywords": conditions_text if conditions_text else "No conditions specified",
             "Brief Summary": brief_summary,
             "Detailed Description": detailed_description,
+            "Sponsor Information": sponsor_info,
+            "Study Locations": location_text if location_text else "No location information available",
+            "Eligibility Summary": eligibility_summary,
+            "Detailed Eligibility Criteria": eligibility_criteria,
             "Study Arms and Treatment Plans": arm_groups_text if arm_groups_text else "No study arms or treatment plans available in the structured API data.",
-            "Interventions": interventions_text if interventions_text else "No interventions available in the structured API data.",
-            "Eligibility Criteria": eligibility_criteria,
-            "Outcomes": outcomes_text if outcomes_text else "No outcomes available in the structured API data.",
-            "Adverse Events": adverse_events_text
+            "Interventions and Agents": interventions_text if interventions_text else "No interventions available in the structured API data.",
+            "Participant Flow and Enrollment": participant_flow_text if participant_flow_text else "No participant flow data available",
+            "Primary and Secondary Outcomes": outcomes_text if outcomes_text else "No outcomes available in the structured API data.",
+            "Adverse Events Profile": adverse_events_text,
+            "Historical Submissions": historical_note
         }
 
         return data_to_summarize, nct_id, None
@@ -279,13 +587,34 @@ if url_input and nct_match and not st.session_state.messages:
         for section, text_content in data_to_summarize.items():
             if text_content and text_content not in ["No study arms or treatment plans available in the structured API data.", "No interventions available in the structured API data.", "No outcomes available in the structured API data.", "No adverse events reported in the structured API data."]:
                 with st.spinner(f"Summarizing '{section}'..."):
-                    initial_prompt = f"Please provide a concise summary of the following section from a clinical trial protocol:\n\n**Section:** {section}\n**Content:** {text_content}"
-                    
+                    initial_prompt = f"""Please provide a comprehensive summary of the following section from a clinical trial protocol. Follow the structure and format shown in the template below as closely as possible:
+
+{mock_summary_template}
+
+**Section:** {section}
+**Content:** {text_content}
+
+INSTRUCTIONS:
+1. Extract and organize the relevant information from the content
+2. Present it in a structured format similar to the template
+3. Create tables where appropriate (use markdown table format)
+4. For treatment plans, extract dose levels, patient numbers, and objectives
+5. For adverse events, group by organ system and show incidence rates
+6. For objectives, clearly distinguish between safety and efficacy endpoints
+7. If specific information is not available in the content, note that it is not available rather than making it up
+8. Pay special attention to:
+   - Dose escalation schemes and dose levels
+   - Patient enrollment numbers per arm
+   - MTD and RP2D information
+   - RECIST criteria and response rates
+   - ECOG performance status requirements
+   - Biomarker analysis plans
+
+Format tables using proper markdown syntax with clear headers and organized data."""
                     messages_for_api = [
-                        {"role": "system", "content": "You are a medical summarization assistant. Provide a concise and clear summary of the provided text, focusing on the key information for the given section. Do not invent information."},
+                        {"role": "system", "content": "You are a medical summarization assistant specializing in clinical trial protocols. You excel at extracting and organizing complex clinical data into clear, structured summaries. Focus on creating well-formatted tables for treatment plans, adverse events, and study arms. Always distinguish between Phase 1 safety objectives (MTD/RP2D) and Phase 2 efficacy objectives (ORR, PFS, OS). Present adverse events grouped by organ system with incidence rates. Extract dose information, patient numbers, and enrollment details accurately. Use markdown formatting for tables and clear section headers. Do not invent information that is not present in the source material."},
                         {"role": "user", "content": initial_prompt}
                     ]
-                    
                     section_summary, summary_error = summarize_with_gpt4o(messages_for_api)
 
                 if summary_error:
