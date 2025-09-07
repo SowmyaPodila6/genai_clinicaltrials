@@ -4,6 +4,7 @@ import requests
 import re
 import os
 import sqlite3
+import uuid
 
 # Set up the OpenAI API key from Streamlit secrets
 openai.api_key = st.secrets["OPENAI_API_KEY"]
@@ -20,6 +21,7 @@ def init_db():
     c.execute('''
         CREATE TABLE IF NOT EXISTS chat_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
             role TEXT NOT NULL,
             content TEXT NOT NULL
         )
@@ -27,22 +29,31 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_message_to_db(role, content):
-    """Saves a single message to the database."""
+def save_message_to_db(conversation_id, role, content):
+    """Saves a single message to the database with a conversation ID."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("INSERT INTO chat_messages (role, content) VALUES (?, ?)", (role, content))
+    c.execute("INSERT INTO chat_messages (conversation_id, role, content) VALUES (?, ?, ?)", (conversation_id, role, content))
     conn.commit()
     conn.close()
 
-def load_messages_from_db():
-    """Loads all chat messages from the database."""
+def load_messages_from_db(conversation_id):
+    """Loads all chat messages for a specific conversation ID."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT role, content FROM chat_messages ORDER BY id")
+    c.execute("SELECT role, content FROM chat_messages WHERE conversation_id = ? ORDER BY id", (conversation_id,))
     messages = [{"role": row[0], "content": row[1]} for row in c.fetchall()]
     conn.close()
     return messages
+
+def get_all_conversations():
+    """Returns a list of all unique conversation IDs in the database."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT conversation_id FROM chat_messages ORDER BY id DESC")
+    conversations = [row[0] for row in c.fetchall()]
+    conn.close()
+    return conversations
 
 # --- Main App Logic ---
 
@@ -95,11 +106,26 @@ def summarize_with_gpt4o(messages):
 init_db()
 
 st.title("Clinical Trial Protocol Summarizer Chatbot (SQLite)")
+
+st.sidebar.header("Past Chats")
+conversations = get_all_conversations()
+for convo_id in conversations:
+    if st.sidebar.button(convo_id, key=convo_id):
+        st.session_state.messages = load_messages_from_db(convo_id)
+        st.session_state.current_convo_id = convo_id
+
+if st.sidebar.button("Start New Chat", key="new_chat_button"):
+    st.session_state.messages = []
+    st.session_state.current_convo_id = str(uuid.uuid4())
+    st.experimental_rerun()
+
 st.markdown("Enter a ClinicalTrials.gov URL to start a conversation about the study.")
 
-# Initialize chat history by loading from the database
 if "messages" not in st.session_state:
-    st.session_state.messages = load_messages_from_db()
+    st.session_state.messages = []
+
+if "current_convo_id" not in st.session_state:
+    st.session_state.current_convo_id = str(uuid.uuid4())
 
 # Display existing chat messages
 for message in st.session_state.messages:
@@ -125,7 +151,7 @@ if url_input and nct_match and not st.session_state.messages:
         st.session_state.messages.append({"role": "user", "content": f"URL: {url_input}"})
         with st.chat_message("user"):
             st.markdown(f"URL: {url_input}")
-        save_message_to_db("user", f"URL: {url_input}")
+        save_message_to_db(st.session_state.current_convo_id, "user", f"URL: {url_input}")
             
         st.success("Protocol details fetched successfully! Generating summary...")
         
@@ -146,14 +172,14 @@ if url_input and nct_match and not st.session_state.messages:
             with st.expander("See Original Protocol Text"):
                 st.text(protocol_text)
             
-            save_message_to_db("assistant", summary)
+            save_message_to_db(st.session_state.current_convo_id, "assistant", summary)
             
 # Handle follow-up chat input
 if prompt := st.chat_input("Ask a follow-up question about the study..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
-    save_message_to_db("user", prompt)
+    save_message_to_db(st.session_state.current_convo_id, "user", prompt)
 
     messages_for_api = [
         {"role": "system", "content": "You are a medical summarization assistant. Answer questions based on the provided protocol text. Do not invent information."},
@@ -170,4 +196,4 @@ if prompt := st.chat_input("Ask a follow-up question about the study..."):
                 st.markdown(response)
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 
-                save_message_to_db("assistant", response)
+                save_message_to_db(st.session_state.current_convo_id, "assistant", response)
