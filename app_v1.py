@@ -89,8 +89,8 @@ def get_protocol_data(nct_number):
         # Design Module
         design_module = protocol_section.get('designModule', {})
         study_type = design_module.get('studyType', 'N/A')
-        study_design = design_module.get('studyDesignInfo', {}).get('studyDesign', 'N/A')
-        study_phase = design_module.get('phaseList', {}).get('phase', ['N/A'])[0]
+        study_design = design_module.get('designInfo', {}).get('interventionModel', 'N/A')
+        study_phase = ", ".join(design_module.get('phases', ['N/A']))
         
         # Interventions and Arm Groups
         arms_interventions_module = protocol_section.get('armsInterventionsModule', {})
@@ -141,7 +141,7 @@ def get_protocol_data(nct_number):
                     organ_system = event.get('adverseEventOrganSystem', 'N/A')
                     adverse_events_text += f"- Term: {term}, Organ System: {organ_system}\n"
         else:
-            adverse_events_text = "No adverse events reported."
+            adverse_events_text = "No adverse events reported in the structured API data."
 
         # Structured data for section-wise summarization
         data_to_summarize = {
@@ -152,10 +152,10 @@ def get_protocol_data(nct_number):
             "Study Phase": study_phase,
             "Brief Summary": brief_summary,
             "Detailed Description": detailed_description,
-            "Study Arms and Treatment Plans": arm_groups_text,
-            "Interventions": interventions_text,
+            "Study Arms and Treatment Plans": arm_groups_text if arm_groups_text else "No study arms or treatment plans available in the structured API data.",
+            "Interventions": interventions_text if interventions_text else "No interventions available in the structured API data.",
             "Eligibility Criteria": eligibility_criteria,
-            "Outcomes": outcomes_text,
+            "Outcomes": outcomes_text if outcomes_text else "No outcomes available in the structured API data.",
             "Adverse Events": adverse_events_text
         }
 
@@ -277,7 +277,7 @@ if url_input and nct_match and not st.session_state.messages:
         
         full_summary = ""
         for section, text_content in data_to_summarize.items():
-            if text_content:
+            if text_content and text_content not in ["No study arms or treatment plans available in the structured API data.", "No interventions available in the structured API data.", "No outcomes available in the structured API data.", "No adverse events reported in the structured API data."]:
                 with st.spinner(f"Summarizing '{section}'..."):
                     initial_prompt = f"Please provide a concise summary of the following section from a clinical trial protocol:\n\n**Section:** {section}\n**Content:** {text_content}"
                     
@@ -293,6 +293,8 @@ if url_input and nct_match and not st.session_state.messages:
                     full_summary += f"### **{section}**\n\n_Summary failed due to an error._\n\n"
                 else:
                     full_summary += f"### **{section}**\n\n{section_summary}\n\n"
+            else:
+                full_summary += f"### **{section}**\n\n{text_content}\n\n"
         
         st.session_state.messages.append({"role": "assistant", "content": full_summary})
         with st.chat_message("assistant"):
@@ -305,7 +307,6 @@ if url_input and nct_match and not st.session_state.messages:
             mime="application/pdf"
         )
         
-        # Fixed the URL generation to ensure nct_id is a clean string.
         if nct_id and nct_id != 'N/A':
             st.markdown(f"**<a href='https://clinicaltrials.gov/study/{nct_id}' target='_blank'>View Full Protocol on ClinicalTrials.gov</a>**", unsafe_allow_html=True)
         else:
