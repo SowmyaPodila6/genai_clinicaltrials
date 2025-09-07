@@ -490,44 +490,93 @@ def summarize_with_gpt4o(messages):
         return None, f"An unexpected error occurred during summarization: {e}"
 
 def create_summary_pdf(summary_text, nct_id):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    pdf.set_margins(10, 10, 10)
-    
-    # Add Title
-    pdf.set_font("Arial", 'B', 16)
-    pdf.cell(200, 10, txt=f"Clinical Protocol Summary for NCT ID: {nct_id}", ln=True, align='C')
-    pdf.ln(5)
-
-    # Add URL
-    pdf.set_font("Arial", 'U', 10)
-    url_text = f"https://clinicaltrials.gov/study/NCT{nct_id}"
-    pdf.set_text_color(0, 0, 255) # Blue
-    pdf.cell(0, 10, url_text, 0, 1, 'L', link=url_text)
-    pdf.set_text_color(0, 0, 0) # Black
-    pdf.ln(5)
-
-    # Add Summary Content
-    pdf.set_font("Arial", size=12)
-    # This will handle markdown-style headers and bold text
-    lines = summary_text.split('\n')
-    for line in lines:
-        if line.startswith('### **'):
-            pdf.set_font("Arial", 'B', 14)
-            pdf.cell(0, 10, line.replace('### **', '').replace('**', ''), ln=True)
-            pdf.set_font("Arial", '', 12)
-        elif line.startswith('**'):
-            pdf.set_font("Arial", 'B', 12)
-            pdf.write(5, line.replace('**', '') + " ")
-            pdf.set_font("Arial", '', 12)
-        else:
-            pdf.write(5, line)
+    try:
+        from fpdf import FPDF
+        import unicodedata
         
-        if line.strip() == "":
-            pdf.ln(5)
+        # Function to clean text for PDF
+        def clean_text_for_pdf(text):
+            if not text:
+                return ""
+            # Remove or replace problematic Unicode characters
+            # Convert to ASCII, replacing non-ASCII chars
+            try:
+                # First try to encode/decode to remove problematic characters
+                cleaned = text.encode('ascii', 'ignore').decode('ascii')
+                return cleaned
+            except:
+                # If that fails, use unicodedata to normalize
+                normalized = unicodedata.normalize('NFKD', text)
+                ascii_text = normalized.encode('ascii', 'ignore').decode('ascii')
+                return ascii_text
+        
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        pdf.set_margins(10, 10, 10)
+        
+        # Add Title
+        pdf.set_font("Arial", 'B', 16)
+        title_text = clean_text_for_pdf(f"Clinical Protocol Summary for NCT ID: {nct_id}")
+        pdf.cell(200, 10, txt=title_text, ln=True, align='C')
+        pdf.ln(5)
 
-    return pdf.output(dest='S').encode('latin1')
+        # Add URL
+        pdf.set_font("Arial", 'U', 10)
+        url_text = f"https://clinicaltrials.gov/study/{nct_id}"
+        pdf.set_text_color(0, 0, 255) # Blue
+        pdf.cell(0, 10, url_text, 0, 1, 'L', link=url_text)
+        pdf.set_text_color(0, 0, 0) # Black
+        pdf.ln(5)
+
+        # Add Summary Content
+        pdf.set_font("Arial", size=12)
+        
+        # Clean the summary text first
+        clean_summary = clean_text_for_pdf(summary_text)
+        
+        # Handle markdown-style headers and bold text
+        lines = clean_summary.split('\n')
+        for line in lines:
+            try:
+                if line.startswith('### **'):
+                    pdf.set_font("Arial", 'B', 14)
+                    header_text = clean_text_for_pdf(line.replace('### **', '').replace('**', ''))
+                    if len(header_text) > 50:  # Truncate very long headers
+                        header_text = header_text[:47] + "..."
+                    pdf.cell(0, 10, header_text, ln=True)
+                    pdf.set_font("Arial", '', 12)
+                elif line.startswith('**'):
+                    pdf.set_font("Arial", 'B', 12)
+                    bold_text = clean_text_for_pdf(line.replace('**', '') + " ")
+                    pdf.write(5, bold_text)
+                    pdf.set_font("Arial", '', 12)
+                else:
+                    line_text = clean_text_for_pdf(line)
+                    if line_text.strip():  # Only write non-empty lines
+                        pdf.write(5, line_text)
+                
+                if line.strip() == "":
+                    pdf.ln(5)
+            except Exception as e:
+                # Skip problematic lines and continue
+                continue
+
+        return pdf.output(dest='S').encode('latin1', 'ignore')
+        
+    except Exception as e:
+        # If PDF creation fails, return a simple error PDF
+        try:
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", size=12)
+            pdf.cell(0, 10, "PDF Generation Error", ln=True)
+            pdf.cell(0, 10, f"NCT ID: {nct_id}", ln=True)
+            pdf.cell(0, 10, "Please download the summary as text instead.", ln=True)
+            return pdf.output(dest='S').encode('latin1', 'ignore')
+        except:
+            # Return minimal bytes if everything fails
+            return b"PDF generation failed due to encoding issues."
 
 # --- Streamlit UI and Chat Management ---
 
@@ -628,13 +677,34 @@ Format tables using proper markdown syntax with clear headers and organized data
         st.session_state.messages.append({"role": "assistant", "content": full_summary})
         with st.chat_message("assistant"):
             st.markdown(full_summary)
+        
+        # Provide both PDF and text download options
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            try:
+                pdf_data = create_summary_pdf(full_summary, nct_id)
+                st.download_button(
+                    label="📄 Download Summary as PDF",
+                    data=pdf_data,
+                    file_name=f"clinical_trial_summary_{nct_id}.pdf",
+                    mime="application/pdf"
+                )
+            except Exception as e:
+                st.error(f"PDF generation failed: {str(e)}")
+        
+        with col2:
+            # Provide text download as backup
+            text_summary = f"Clinical Protocol Summary for NCT ID: {nct_id}\n"
+            text_summary += f"URL: https://clinicaltrials.gov/study/{nct_id}\n\n"
+            text_summary += full_summary
             
-        st.download_button(
-            label="Download Summary as PDF",
-            data=create_summary_pdf(full_summary, nct_id),
-            file_name=f"clinical_trial_summary_{nct_id}.pdf",
-            mime="application/pdf"
-        )
+            st.download_button(
+                label="📝 Download Summary as Text",
+                data=text_summary.encode('utf-8'),
+                file_name=f"clinical_trial_summary_{nct_id}.txt",
+                mime="text/plain"
+            )
         
         if nct_id and nct_id != 'N/A':
             st.markdown(f"**<a href='https://clinicaltrials.gov/study/{nct_id}' target='_blank'>View Full Protocol on ClinicalTrials.gov</a>**", unsafe_allow_html=True)
