@@ -10,40 +10,33 @@ from fpdf import FPDF
 
 # --- Mock Summary Template ---
 mock_summary_template = """
-Below is an example of a desired summary format for a clinical trial protocol:
+Below is an example of a concise clinical trial summary format:
 
-1. Summary
-Title: A Phase 1/2 Study of Agent X (NSC ######) in Combination with Agent Y in Patients with Advanced Non-Small Cell Lung Cancer (NSCLC)
-Design: Phase 1 - Dose-escalation; Phase 2 - Expansion to assess efficacy.
-Primary Objective (Phase 1): Determine MTD and recommended Phase 2 dose (RP2D).
-Primary Objective (Phase 2): Objective response rate (ORR) per RECIST v1.1.
-Secondary Objectives: PFS, OS, safety, symptom relief, biomarker analysis.
-Eligibility: Adults 18 and older, ECOG 0-1, measurable disease, archival & fresh biopsy optional/required.
+# Clinical Trial Summary
 
-2. Historical Submissions with Similar Drugs
-(Note: This information is not always available in the standard ClinicalTrials.gov JSON. Please state if no such data can be found.)
-Protocol ID | Agents Studied | Disease | Phase | Outcome
-NCI-2021-101 | Agent X (mono) | Colorectal | 1 | Grade 3 diarrhea at 100 mg/m2
-... (provide a table if historical data exists in the provided JSON)
+## Study Overview
+Phase 1/2 study of Agent X in combination with Agent Y for advanced NSCLC. Dose-escalation phase followed by expansion cohort.
 
-3. Potential Adverse Events
-System | Common AEs | Serious AEs
-GI | Nausea, diarrhea | Colitis, perforation
-Hematologic | Anemia, neutropenia | Febrile neutropenia
-... (provide a table based on the provided JSON data)
+## Primary Objectives
+• **Phase 1:** Determine MTD and recommended Phase 2 dose (RP2D)
+• **Phase 2:** Objective response rate (ORR) per RECIST v1.1
 
-4. Treatment Plan Overview
-Phase 1 Arms:
-Arm | Dose Level | Agent X (mg/m2) | Agent Y (mg) | Patients
-A | DL1 | 50 | 100 | 3-6
-... (provide a table based on the provided JSON data)
-Phase 2 Expansion:
-Arm | Agent X | Agent Y | Patients | Objective
-1 | 75 mg/m2 | 200 mg | 25 | ORR
-... (provide a table based on the provided JSON data)
+## Treatment Arms & Interventions
+| Phase | Arm | Agent X | Agent Y | Patients | Objective |
+|-------|-----|---------|---------|----------|-----------|
+| 1 | A | 50 mg/m² | 100 mg | 3-6 | Safety/MTD |
+| 2 | Expansion | 75 mg/m² | 200 mg | 25 | Efficacy |
 
-Please use the provided JSON data from a clinical trial to generate a summary that follows this exact format.
-Extract the relevant information and fill in the sections.
+## Eligibility Criteria
+Adults ≥18 years, ECOG 0-1, measurable disease, adequate organ function.
+
+## Enrollment & Status
+Target enrollment: 45 patients. Currently recruiting.
+
+## Safety Profile
+Common AEs: fatigue (60%), nausea (45%), neutropenia (30%). Grade 3+ events: neutropenia (15%), diarrhea (8%).
+
+Keep summaries concise, well-formatted, and focused on available data only.
 """
 
 # Set up the OpenAI API key from Streamlit secrets
@@ -446,25 +439,17 @@ def get_protocol_data(nct_number):
         # Historical submissions note
         historical_note = "Historical Submissions with Similar Drugs: This information is not available in the standard ClinicalTrials.gov JSON data structure."
 
-        # Structured data for section-wise summarization
+        # Structured data for section-wise summarization - focus on key information only
         data_to_summarize = {
-            "Official Title": official_title,
-            "Overall Status": overall_status,
-            "Study Type and Phase": f"{study_type} - {study_phase}",
-            "Study Design Details": study_design_text,
-            "Conditions and Keywords": conditions_text if conditions_text else "No conditions specified",
-            "Brief Summary": brief_summary,
-            "Detailed Description": detailed_description,
-            "Sponsor Information": sponsor_info,
-            "Study Locations": location_text if location_text else "No location information available",
-            "Eligibility Summary": eligibility_summary,
-            "Detailed Eligibility Criteria": eligibility_criteria,
-            "Study Arms and Treatment Plans": arm_groups_text if arm_groups_text else "No study arms or treatment plans available in the structured API data.",
-            "Interventions and Agents": interventions_text if interventions_text else "No interventions available in the structured API data.",
-            "Participant Flow and Enrollment": participant_flow_text if participant_flow_text else "No participant flow data available",
-            "Primary and Secondary Outcomes": outcomes_text if outcomes_text else "No outcomes available in the structured API data.",
-            "Adverse Events Profile": adverse_events_text,
-            "Historical Submissions": historical_note
+            "Study Overview": f"{official_title} | Status: {overall_status} | Type: {study_type} - {study_phase}",
+            "Brief Description": brief_summary,
+            "Primary and Secondary Objectives": outcomes_text if outcomes_text else None,
+            "Treatment Arms and Interventions": f"{arm_groups_text}\n\n{interventions_text}" if (arm_groups_text or interventions_text) else None,
+            "Eligibility Criteria": f"{eligibility_summary}\n\nDetailed Criteria: {eligibility_criteria[:500]}..." if len(eligibility_criteria) > 500 else f"{eligibility_summary}\n\n{eligibility_criteria}",
+            "Enrollment and Participant Flow": participant_flow_text if participant_flow_text else None,
+            "Adverse Events Profile": adverse_events_text if adverse_events_text and "No adverse events reported" not in adverse_events_text else None,
+            "Study Locations": f"{len(locations)} sites across {len(set(loc.get('country', 'Unknown') for loc in locations))} countries" if locations else None,
+            "Sponsor Information": sponsor_info if sponsor_info and sponsor_name != "N/A" else None
         }
 
         return data_to_summarize, nct_id, None
@@ -632,47 +617,74 @@ if url_input and nct_match and not st.session_state.messages:
             
         st.success("Protocol details fetched successfully! Generating summary...")
         
-        full_summary = ""
-        for section, text_content in data_to_summarize.items():
-            if text_content and text_content not in ["No study arms or treatment plans available in the structured API data.", "No interventions available in the structured API data.", "No outcomes available in the structured API data.", "No adverse events reported in the structured API data."]:
-                with st.spinner(f"Summarizing '{section}'..."):
-                    initial_prompt = f"""Please provide a comprehensive summary of the following section from a clinical trial protocol. Follow the structure and format shown in the template below as closely as possible:
+        # Filter sections with meaningful content
+        sections_to_include = {}
+        
+        # Only include sections that have meaningful content
+        for section, content in data_to_summarize.items():
+            if (content and 
+                content != "N/A" and 
+                isinstance(content, str) and
+                "No " not in content[:20] and
+                "not available" not in content.lower() and
+                len(content.strip()) > 30):  # Only substantial content
+                sections_to_include[section] = content
+        
+        # Create consolidated summary
+        with st.spinner("Generating concise clinical trial summary..."):
+            # Prepare consolidated content for single API call
+            consolidated_content = ""
+            for section, content in sections_to_include.items():
+                consolidated_content += f"\n\n**{section}:**\n{content}\n"
+            
+            concise_prompt = f"""Generate a concise, well-formatted clinical trial summary using ONLY the information provided below. Follow this structure and format:
 
-{mock_summary_template}
+# Clinical Trial Summary
 
-**Section:** {section}
-**Content:** {text_content}
+## Study Overview
+[Extract title, phase, design, and brief description - 2-3 sentences max]
 
-INSTRUCTIONS:
-1. Extract and organize the relevant information from the content
-2. Present it in a structured format similar to the template
-3. Create tables where appropriate (use markdown table format)
-4. For treatment plans, extract dose levels, patient numbers, and objectives
-5. For adverse events, group by organ system and show incidence rates
-6. For objectives, clearly distinguish between safety and efficacy endpoints
-7. If specific information is not available in the content, note that it is not available rather than making it up
-8. Pay special attention to:
-   - Dose escalation schemes and dose levels
-   - Patient enrollment numbers per arm
-   - MTD and RP2D information
-   - RECIST criteria and response rates
-   - ECOG performance status requirements
-   - Biomarker analysis plans
+## Primary Objectives
+[List main safety and/or efficacy endpoints - bullet points, be specific]
 
-Format tables using proper markdown syntax with clear headers and organized data."""
-                    messages_for_api = [
-                        {"role": "system", "content": "You are a medical summarization assistant specializing in clinical trial protocols. You excel at extracting and organizing complex clinical data into clear, structured summaries. Focus on creating well-formatted tables for treatment plans, adverse events, and study arms. Always distinguish between Phase 1 safety objectives (MTD/RP2D) and Phase 2 efficacy objectives (ORR, PFS, OS). Present adverse events grouped by organ system with incidence rates. Extract dose information, patient numbers, and enrollment details accurately. Use markdown formatting for tables and clear section headers. Do not invent information that is not present in the source material."},
-                        {"role": "user", "content": initial_prompt}
-                    ]
-                    section_summary, summary_error = summarize_with_gpt4o(messages_for_api)
+## Treatment Arms & Interventions
+[Create a simple table if multiple arms exist, otherwise describe briefly]
 
-                if summary_error:
-                    st.error(summary_error)
-                    full_summary += f"### **{section}**\n\n_Summary failed due to an error._\n\n"
-                else:
-                    full_summary += f"### **{section}**\n\n{section_summary}\n\n"
-            else:
-                full_summary += f"### **{section}**\n\n{text_content}\n\n"
+## Eligibility Criteria
+[Key inclusion criteria in 1-2 sentences]
+
+## Enrollment & Participant Flow
+[Patient numbers and enrollment status if available]
+
+## Safety Profile
+[Only include if adverse events data is available - summarize key findings]
+
+---
+
+**Available Data:**
+{consolidated_content}
+
+**Formatting Requirements:**
+- Use clear section headers (##)
+- Keep each section to 1-3 sentences or a simple table
+- Use bullet points for lists
+- Only include sections where meaningful data exists
+- Skip any section that says "not available" or has insufficient information
+- Make it readable and concise - aim for 200-400 words total
+- Use markdown formatting for better readability"""
+
+            messages_for_api = [
+                {"role": "system", "content": "You are a clinical research summarization expert. Create concise, well-formatted summaries that focus only on available information. Avoid filler text and sections with insufficient data. Use clear markdown formatting and keep summaries under 400 words while including all key available information."},
+                {"role": "user", "content": concise_prompt}
+            ]
+            
+            full_summary, summary_error = summarize_with_gpt4o(messages_for_api)
+        
+        if summary_error:
+            st.error(summary_error)
+            full_summary = "Summary generation failed due to an error."
+        elif not full_summary:
+            full_summary = "Insufficient data available to generate a meaningful summary."
         
         st.session_state.messages.append({"role": "assistant", "content": full_summary})
         with st.chat_message("assistant"):
