@@ -49,21 +49,22 @@ def load_messages_from_db():
 def get_protocol_text(nct_number):
     try:
         ct = ClinicalTrials()
+        # Updated to use valid fields for the JSON format
         study_fields = ct.get_study_fields(
             search_expr=f"NCTId:{nct_number}",
-            fields=["BriefTitle", "OfficialTitle", "BriefSummary", "DetailedDescription"],
+            fields=["NCTId", "OfficialTitle", "BriefSummary", "DetailedDescription"],
             max_studies=1,
             fmt="json"
         )
         if not study_fields:
             return None, "Error: Could not retrieve study data for this NCT number."
         study_data = study_fields[0]
-        brief_title = study_data.get('BriefTitle')
+        nct_id = study_data.get('NCTId')
         official_title = study_data.get('OfficialTitle')
         brief_summary = study_data.get('BriefSummary')
         detailed_description = study_data.get('DetailedDescription')
         
-        protocol_text = f"**Brief Title:** {brief_title}\n\n**Official Title:** {official_title}\n\n**Brief Summary:**\n{brief_summary}\n\n**Detailed Description:**\n{detailed_description}"
+        protocol_text = f"**NCT ID:** {nct_id}\n\n**Official Title:** {official_title}\n\n**Brief Summary:**\n{brief_summary}\n\n**Detailed Description:**\n{detailed_description}"
         return protocol_text, None
     except Exception as e:
         return None, f"An error occurred while fetching the protocol: {e}"
