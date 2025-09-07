@@ -6,17 +6,11 @@ import os
 import sqlite3
 import uuid
 
-# Set up the OpenAI API key from Streamlit secrets
-openai.api_key = st.secrets["OPENAI_API_KEY"]
-
-# Define the database file
-DB_FILE = "chat_history.db"
-
-# --- Database Helper Functions ---
-
-def init_db():
-    """Initializes the SQLite database and creates a chat_messages table."""
-    conn = sqlite3.connect(DB_FILE)
+# --- Best Practices: Centralize Database Connection with caching ---
+@st.cache_resource
+def get_db_connection():
+    """Returns a cached database connection."""
+    conn = sqlite3.connect("chat_history.db")
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS chat_messages (
@@ -27,46 +21,43 @@ def init_db():
         )
     ''')
     conn.commit()
-    conn.close()
+    return conn
+
+# --- Database Helper Functions ---
 
 def save_message_to_db(conversation_id, role, content):
     """Saves a single message to the database with a conversation ID."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("INSERT INTO chat_messages (conversation_id, role, content) VALUES (?, ?, ?)", (conversation_id, role, content))
     conn.commit()
-    conn.close()
 
 def load_messages_from_db(conversation_id):
     """Loads all chat messages for a specific conversation ID."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT role, content FROM chat_messages WHERE conversation_id = ? ORDER BY id", (conversation_id,))
     messages = [{"role": row[0], "content": row[1]} for row in c.fetchall()]
-    conn.close()
     return messages
 
 def get_all_conversations():
     """Returns a list of all unique conversation IDs in the database."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT DISTINCT conversation_id FROM chat_messages ORDER BY id DESC")
     conversations = [row[0] for row in c.fetchall()]
-    conn.close()
     return conversations
 
-# --- Main App Logic ---
+# --- App Logic ---
 
 def get_protocol_text(nct_number):
     try:
-        # Use requests to directly access the ClinicalTrials.gov API v2.0
         api_url = f"https://clinicaltrials.gov/api/v2/studies/{nct_number}"
         response = requests.get(api_url)
-        response.raise_for_status()  # This will raise an HTTPError if the status code is 4xx or 5xx
+        response.raise_for_status()
         
         study_data = response.json()
         
-        # Check if the study was found
         if 'protocolSection' not in study_data:
             return None, "Error: Study data could not be found for this NCT number."
 
@@ -102,12 +93,10 @@ def summarize_with_gpt4o(messages):
 
 # --- Streamlit UI and Chat Management ---
 
-# Initialize the database on startup
-init_db()
-
-# Check for rerun flag at the top of the script
-if "rerun_flag" in st.session_state and st.session_state.rerun_flag:
-    st.session_state.rerun_flag = False
+def new_chat_click():
+    st.session_state.messages = []
+    st.session_state.current_convo_id = str(uuid.uuid4())
+    st.session_state.url_key = str(uuid.uuid4())
     st.rerun()
 
 st.title("Clinical Trial Protocol Summarizer Chatbot (SQLite)")
@@ -118,12 +107,9 @@ for convo_id in conversations:
     if st.sidebar.button(convo_id, key=convo_id):
         st.session_state.messages = load_messages_from_db(convo_id)
         st.session_state.current_convo_id = convo_id
+        st.rerun()
 
-if st.sidebar.button("Start New Chat", key="new_chat_button"):
-    st.session_state.messages = []
-    st.session_state.current_convo_id = str(uuid.uuid4())
-    st.session_state.url_key = str(uuid.uuid4()) # Added to reset the URL input
-    st.session_state.rerun_flag = True
+st.sidebar.button("Start New Chat", key="new_chat_button", on_click=new_chat_click)
 
 st.markdown("Enter a ClinicalTrials.gov URL to start a conversation about the study.")
 
@@ -132,7 +118,7 @@ if "messages" not in st.session_state:
 
 if "current_convo_id" not in st.session_state:
     st.session_state.current_convo_id = str(uuid.uuid4())
-    st.session_state.url_key = str(uuid.uuid4()) # Initialize the URL key
+    st.session_state.url_key = str(uuid.uuid4())
 
 # Display existing chat messages
 for message in st.session_state.messages:
