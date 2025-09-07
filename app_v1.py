@@ -92,9 +92,13 @@ def get_protocol_data(nct_number):
         # Interventions and Arm Groups
         arms_interventions_module = protocol_section.get('armsInterventionsModule', {})
         arm_groups_list = arms_interventions_module.get('armGroups', [])
+        if not isinstance(arm_groups_list, list):
+            arm_groups_list = []
         arm_groups_text = "\n".join([f"- ID: {ag.get('armGroupId', 'N/A')}\n  Title: {ag.get('armGroupLabel', 'N/A')}\n  Description: {ag.get('armGroupDescription', 'N/A')}" for ag in arm_groups_list])
         
         interventions_list = arms_interventions_module.get('interventions', [])
+        if not isinstance(interventions_list, list):
+            interventions_list = []
         interventions_text = "\n".join([f"- Name: {i.get('interventionName', 'N/A')}\n  Type: {i.get('interventionType', 'N/A')}" for i in interventions_list])
 
         # Eligibility Module
@@ -109,7 +113,11 @@ def get_protocol_data(nct_number):
         # Adverse Events (from resultsSection)
         adverse_events_module = results_section.get('adverseEventsModule', {})
         serious_events = adverse_events_module.get('seriousEvents', [])
+        if not isinstance(serious_events, list):
+            serious_events = []
         other_events = adverse_events_module.get('otherEvents', [])
+        if not isinstance(other_events, list):
+            other_events = []
         
         adverse_events_text = ""
         if serious_events or other_events:
