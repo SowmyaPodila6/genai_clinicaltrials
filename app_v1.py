@@ -105,6 +105,11 @@ def summarize_with_gpt4o(messages):
 # Initialize the database on startup
 init_db()
 
+# Check for rerun flag at the top of the script
+if "rerun_flag" in st.session_state and st.session_state.rerun_flag:
+    st.session_state.rerun_flag = False
+    st.experimental_rerun()
+
 st.title("Clinical Trial Protocol Summarizer Chatbot (SQLite)")
 
 st.sidebar.header("Past Chats")
@@ -117,7 +122,7 @@ for convo_id in conversations:
 if st.sidebar.button("Start New Chat", key="new_chat_button"):
     st.session_state.messages = []
     st.session_state.current_convo_id = str(uuid.uuid4())
-    st.experimental_rerun()
+    st.session_state.rerun_flag = True
 
 st.markdown("Enter a ClinicalTrials.gov URL to start a conversation about the study.")
 
