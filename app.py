@@ -11,14 +11,20 @@ from fpdf import FPDF
 # Set up the OpenAI API key from Streamlit secrets
 openai.api_key = st.secrets["OPENAI_API_KEY"]
 
-# Define the database file
-DB_FILE = "chat_history.db"
-
 # --- Database Helper Functions ---
 
+def get_db_path():
+    """
+    Gets the unique database path for the current user session.
+    This ensures that each session has its own isolated database file.
+    """
+    if "db_path" not in st.session_state:
+        st.session_state.db_path = f"chat_history_{st.session_state.current_convo_id}.db"
+    return st.session_state.db_path
+
 def get_db_connection():
-    """Connects to the database and ensures the table exists."""
-    conn = sqlite3.connect(DB_FILE)
+    """Connects to the session-specific database and ensures the table exists."""
+    conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS chat_messages (
@@ -32,7 +38,7 @@ def get_db_connection():
     return conn
 
 def save_message_to_db(conversation_id, role, content):
-    """Saves a single message to the database with a conversation ID."""
+    """Saves a single message to the session-specific database."""
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("INSERT INTO chat_messages (conversation_id, role, content) VALUES (?, ?, ?)", (conversation_id, role, content))
@@ -40,22 +46,13 @@ def save_message_to_db(conversation_id, role, content):
     conn.close()
 
 def load_messages_from_db(conversation_id):
-    """Loads all chat messages for a specific conversation ID."""
+    """Loads all chat messages for the specific conversation ID from the session-specific database."""
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT role, content FROM chat_messages WHERE conversation_id = ? ORDER BY id", (conversation_id,))
     messages = [{"role": row[0], "content": row[1]} for row in c.fetchall()]
     conn.close()
     return messages
-
-def get_all_conversations():
-    """Returns a list of all unique conversation IDs in the database."""
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT DISTINCT conversation_id FROM chat_messages ORDER BY id DESC")
-    conversations = [row[0] for row in c.fetchall()]
-    conn.close()
-    return conversations
 
 # --- Clinical Trials API Logic ---
 
@@ -152,18 +149,11 @@ def new_chat_click():
     st.session_state.url_key = str(uuid.uuid4())
     st.rerun()
 
-st.title("Gen AI-Powered Clinical Protocol Summarizer v3")
+st.title("Gen AI-Powered Clinical Protocol Summarizer v4")
 st.markdown("Enter a ClinicalTrials.gov URL below to get a formatted summary of the study.")
 
-st.sidebar.header("Past Chats")
-conversations = get_all_conversations()
-for convo_id in conversations:
-    if st.sidebar.button(convo_id, key=convo_id):
-        st.session_state.messages = load_messages_from_db(convo_id)
-        st.session_state.current_convo_id = convo_id
-        st.rerun()
-
-st.sidebar.button("Start New Chat", key="new_chat_button", on_click=new_chat_click)
+# The "Past Chats" functionality is no longer available to prevent database concurrency issues.
+# Each user session will now have a fresh, isolated conversation.
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
