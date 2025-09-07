@@ -305,7 +305,11 @@ if url_input and nct_match and not st.session_state.messages:
             mime="application/pdf"
         )
         
-        st.markdown(f"**<a href='https://clinicaltrials.gov/study/NCT{nct_id}' target='_blank'>View Full Protocol on ClinicalTrials.gov</a>**", unsafe_allow_html=True)
+        # Fixed the URL generation to ensure nct_id is a clean string.
+        if nct_id and nct_id != 'N/A':
+            st.markdown(f"**<a href='https://clinicaltrials.gov/study/{nct_id}' target='_blank'>View Full Protocol on ClinicalTrials.gov</a>**", unsafe_allow_html=True)
+        else:
+            st.markdown("Could not generate a link to the full protocol.")
         
         save_message_to_db(st.session_state.current_convo_id, "assistant", full_summary)
             
