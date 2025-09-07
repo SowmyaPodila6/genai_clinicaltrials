@@ -411,7 +411,7 @@ def get_protocol_data(nct_number):
                 if len(sites) > 3:
                     location_text += f"  • ... and {len(sites)-3} more sites\n"
         
-        # Extract additional eligibility details
+        # Extract basic demographic eligibility details
         eligibility_module = protocol_section.get('eligibilityModule', {})
         min_age = eligibility_module.get('minimumAge', 'N/A')
         max_age = eligibility_module.get('maximumAge', 'N/A')
@@ -419,12 +419,138 @@ def get_protocol_data(nct_number):
         healthy_volunteers = eligibility_module.get('healthyVolunteers', False)
         std_ages = eligibility_module.get('stdAges', [])
         
-        eligibility_summary = f"Age: {min_age}"
+        # Enhanced eligibility criteria processing
+        def process_eligibility_criteria(eligibility_text):
+            """Process eligibility criteria to separate inclusion and exclusion criteria"""
+            if not eligibility_text or eligibility_text == 'N/A':
+                return "No eligibility criteria available", [], []
+            
+            # Convert to string if it's not already
+            text = str(eligibility_text).strip()
+            
+            # Split into lines for processing
+            lines = text.split('\n')
+            
+            inclusion_criteria = []
+            exclusion_criteria = []
+            current_section = None
+            
+            # Common section headers
+            inclusion_headers = ['inclusion criteria', 'inclusion', 'eligibility criteria', 'eligible participants']
+            exclusion_headers = ['exclusion criteria', 'exclusion', 'excluded participants', 'exclusionary criteria']
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                line_lower = line.lower()
+                
+                # Check for section headers
+                if any(header in line_lower for header in inclusion_headers):
+                    current_section = 'inclusion'
+                    continue
+                elif any(header in line_lower for header in exclusion_headers):
+                    current_section = 'exclusion'
+                    continue
+                
+                # Process criteria items
+                if line and (line.startswith('-') or line.startswith('•') or line.startswith('*') or 
+                           line[0].isdigit() or line.startswith('o ') or line.startswith('•')):
+                    # Clean up the line - be more careful with age ranges
+                    clean_line = line.strip()
+                    
+                    # Remove bullet points but preserve numbers that might be part of content (like ages)
+                    if clean_line.startswith('-'):
+                        clean_line = clean_line[1:].strip()
+                    elif clean_line.startswith('•'):
+                        clean_line = clean_line[1:].strip()
+                    elif clean_line.startswith('*'):
+                        clean_line = clean_line[1:].strip()
+                    elif clean_line[0].isdigit() and '. ' in clean_line[:5]:
+                        # Handle numbered lists like "1. criteria" but preserve age ranges like "18-75"
+                        period_index = clean_line.find('. ')
+                        if period_index > 0 and period_index < 5:
+                            clean_line = clean_line[period_index + 2:].strip()
+                    
+                    # Skip if the cleaned line is too short or just punctuation
+                    if len(clean_line) < 5:
+                        continue
+                    
+                    if current_section == 'inclusion':
+                        inclusion_criteria.append(clean_line)
+                    elif current_section == 'exclusion':
+                        exclusion_criteria.append(clean_line)
+                    else:
+                        # If no clear section, try to determine based on content
+                        if any(word in line_lower for word in ['must', 'should', 'required', 'age ≥', 'age >', 'performance status', 'confirmed', 'diagnosis']):
+                            inclusion_criteria.append(clean_line)
+                        elif any(word in line_lower for word in ['cannot', 'must not', 'prohibited', 'contraindicated', 'excluded']):
+                            exclusion_criteria.append(clean_line)
+                        else:
+                            inclusion_criteria.append(clean_line)  # Default to inclusion
+                elif len(line) > 20 and current_section:  # Longer descriptive text
+                    if current_section == 'inclusion':
+                        inclusion_criteria.append(line)
+                    elif current_section == 'exclusion':
+                        exclusion_criteria.append(line)
+            
+            # Create summary
+            summary_parts = []
+            if inclusion_criteria:
+                # Get key inclusion criteria (first 3-4 most important)
+                key_inclusion = inclusion_criteria[:4]
+                summary_parts.append(f"Key Inclusion: {'; '.join(key_inclusion[:2])}")
+            
+            if exclusion_criteria:
+                # Get key exclusion criteria (first 2-3 most important)
+                key_exclusion = exclusion_criteria[:3]
+                summary_parts.append(f"Key Exclusions: {'; '.join(key_exclusion[:2])}")
+            
+            summary = ". ".join(summary_parts) if summary_parts else "Standard eligibility criteria apply"
+            
+            return summary, inclusion_criteria, exclusion_criteria
+
+        # Process eligibility criteria
+        eligibility_criteria_summary, inclusion_list, exclusion_list = process_eligibility_criteria(eligibility_criteria)
+        
+        # Create detailed eligibility text
+        detailed_eligibility = ""
+        
+        # Add basic demographics first
+        detailed_eligibility += f"**Demographics:** Age {min_age}"
         if max_age and max_age != 'N/A':
-            eligibility_summary += f" to {max_age}"
-        eligibility_summary += f"\nSex: {sex}\nHealthy Volunteers: {'Yes' if healthy_volunteers else 'No'}"
-        if std_ages:
-            eligibility_summary += f"\nAge Groups: {', '.join(std_ages)}"
+            detailed_eligibility += f" to {max_age}"
+        detailed_eligibility += f", {sex}, Healthy volunteers: {'Yes' if healthy_volunteers else 'No'}\n\n"
+        
+        # Add inclusion criteria
+        if inclusion_list:
+            detailed_eligibility += "**Inclusion Criteria:**\n"
+            for i, criterion in enumerate(inclusion_list[:8], 1):  # Limit to top 8
+                detailed_eligibility += f"{i}. {criterion}\n"
+            if len(inclusion_list) > 8:
+                detailed_eligibility += f"... and {len(inclusion_list)-8} additional inclusion criteria\n"
+            detailed_eligibility += "\n"
+        
+        # Add exclusion criteria
+        if exclusion_list:
+            detailed_eligibility += "**Exclusion Criteria:**\n"
+            for i, criterion in enumerate(exclusion_list[:8], 1):  # Limit to top 8
+                detailed_eligibility += f"{i}. {criterion}\n"
+            if len(exclusion_list) > 8:
+                detailed_eligibility += f"... and {len(exclusion_list)-8} additional exclusion criteria\n"
+            detailed_eligibility += "\n"
+        
+        # If no structured criteria found, include original text (truncated)
+        if not inclusion_list and not exclusion_list and eligibility_criteria != 'N/A':
+            detailed_eligibility += "**Full Eligibility Criteria:**\n"
+            if len(eligibility_criteria) > 800:
+                detailed_eligibility += eligibility_criteria[:800] + "... [truncated]"
+            else:
+                detailed_eligibility += eligibility_criteria
+        
+        # Create comprehensive eligibility summary
+        eligibility_comprehensive = f"{eligibility_criteria_summary}\n\n{detailed_eligibility.strip()}"
         
         # Extract conditions/diseases studied
         conditions_module = protocol_section.get('conditionsModule', {})
@@ -446,7 +572,7 @@ def get_protocol_data(nct_number):
             "Brief Description": brief_summary,
             "Primary and Secondary Objectives": outcomes_text if outcomes_text else None,
             "Treatment Arms and Interventions": f"{arm_groups_text}\n\n{interventions_text}" if (arm_groups_text or interventions_text) else None,
-            "Eligibility Criteria": f"{eligibility_summary}\n\nDetailed Criteria: {eligibility_criteria[:500]}..." if len(eligibility_criteria) > 500 else f"{eligibility_summary}\n\n{eligibility_criteria}",
+            "Eligibility Criteria": eligibility_comprehensive,
             "Enrollment and Participant Flow": participant_flow_text if participant_flow_text else None,
             "Adverse Events Profile": adverse_events_text if adverse_events_text and "No adverse events reported" not in adverse_events_text else None,
             "Study Locations": f"{len(locations)} sites across {len(set(loc.get('country', 'Unknown') for loc in locations))} countries" if locations else None,
@@ -466,7 +592,7 @@ def summarize_with_gpt4o(messages):
         response = openai.chat.completions.create(
             model="gpt-4o",
             messages=messages,
-            temperature=0.3
+            temperature=0.1
         )
         summary = response.choices[0].message.content.strip()
         return summary, None
