@@ -13,27 +13,28 @@ mock_summary_template = """
 Below is an example of a concise clinical trial summary format:
 
 # Clinical Trial Summary
+## Phase 1/2 Study of Agent X in Combination with Agent Y for Advanced NSCLC
 
-## Study Overview
-Phase 1/2 study of Agent X in combination with Agent Y for advanced NSCLC. Dose-escalation phase followed by expansion cohort.
+### Study Overview
+Dose-escalation phase followed by expansion cohort to assess safety and efficacy.
 
-## Primary Objectives
+### Primary Objectives
 • **Phase 1:** Determine MTD and recommended Phase 2 dose (RP2D)
 • **Phase 2:** Objective response rate (ORR) per RECIST v1.1
 
-## Treatment Arms & Interventions
+### Treatment Arms & Interventions
 | Phase | Arm | Agent X | Agent Y | Patients | Objective |
 |-------|-----|---------|---------|----------|-----------|
 | 1 | A | 50 mg/m² | 100 mg | 3-6 | Safety/MTD |
 | 2 | Expansion | 75 mg/m² | 200 mg | 25 | Efficacy |
 
-## Eligibility Criteria
+### Eligibility Criteria
 Adults ≥18 years, ECOG 0-1, measurable disease, adequate organ function.
 
-## Enrollment & Status
+### Enrollment & Status
 Target enrollment: 45 patients. Currently recruiting.
 
-## Safety Profile
+### Safety Profile
 Common AEs: fatigue (60%), nausea (45%), neutropenia (30%). Grade 3+ events: neutropenia (15%), diarrhea (8%).
 
 Keep summaries concise, well-formatted, and focused on available data only.
@@ -102,7 +103,7 @@ def get_protocol_data(nct_number):
         results_section = study_data.get('resultsSection', {})
         
         if not protocol_section:
-            return None, None, "Error: Study data could not be found for this NCT number."
+            return None, None, "Error: Study data could not be found for this NCT number.", None
 
         # Identification Module
         identification_module = protocol_section.get('identificationModule', {})
@@ -452,13 +453,13 @@ def get_protocol_data(nct_number):
             "Sponsor Information": sponsor_info if sponsor_info and sponsor_name != "N/A" else None
         }
 
-        return data_to_summarize, nct_id, None
+        return data_to_summarize, nct_id, None, study_data
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
-            return None, None, f"Error: Study with NCT number {nct_number} was not found on ClinicalTrials.gov."
-        return None, None, f"HTTP error occurred while fetching the protocol: {e}"
+            return None, None, f"Error: Study with NCT number {nct_number} was not found on ClinicalTrials.gov.", None
+        return None, None, f"HTTP error occurred while fetching the protocol: {e}", None
     except Exception as e:
-        return None, None, f"An error occurred while fetching the protocol: {e}"
+        return None, None, f"An error occurred while fetching the protocol: {e}", None
 
 def summarize_with_gpt4o(messages):
     try:
@@ -671,6 +672,17 @@ for convo_id in conversations:
                         st.session_state.current_study_title = title_match.group(1).strip()
                     else:
                         st.session_state.current_study_title = ""
+                    
+                    # Try to restore raw data by re-fetching if needed (optional enhancement)
+                    # Note: This will make an API call to restore download capabilities
+                    try:
+                        data_to_summarize, nct_id, fetch_error, raw_study_data = get_protocol_data(st.session_state.current_nct_id)
+                        if not fetch_error and raw_study_data:
+                            st.session_state.raw_json_data = raw_study_data
+                            st.session_state.processed_data = data_to_summarize
+                    except:
+                        # If re-fetching fails, just continue without raw data downloads
+                        pass
                 break
         
         st.rerun()
@@ -694,34 +706,81 @@ if hasattr(st.session_state, 'current_summary') and st.session_state.current_sum
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📥 Download Current Summary")
     
-    # PDF Download
-    try:
-        pdf_data = create_summary_pdf(
-            st.session_state.current_summary, 
-            st.session_state.current_nct_id
-        )
+    # Summary downloads
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        # PDF Download
+        try:
+            pdf_data = create_summary_pdf(
+                st.session_state.current_summary, 
+                st.session_state.current_nct_id
+            )
+            st.sidebar.download_button(
+                label="📄 PDF",
+                data=pdf_data,
+                file_name=f"clinical_trial_summary_{st.session_state.current_nct_id}.pdf",
+                mime="application/pdf",
+                key="sidebar_pdf_download"
+            )
+        except Exception as e:
+            st.sidebar.error("PDF error")
+    
+    with col2:
+        # Text Download
+        text_summary = f"Clinical Trial Summary: {st.session_state.current_nct_id}\n"
+        text_summary += f"URL: https://clinicaltrials.gov/study/{st.session_state.current_nct_id}\n\n"
+        text_summary += st.session_state.current_summary
+        
         st.sidebar.download_button(
-            label="📄 PDF Download",
-            data=pdf_data,
-            file_name=f"clinical_trial_summary_{st.session_state.current_nct_id}.pdf",
-            mime="application/pdf",
-            key="sidebar_pdf_download"
+            label="📝 Text",
+            data=text_summary.encode('utf-8'),
+            file_name=f"clinical_trial_summary_{st.session_state.current_nct_id}.txt",
+            mime="text/plain",
+            key="sidebar_text_download"
         )
-    except Exception as e:
-        st.sidebar.error("PDF generation error")
     
-    # Text Download
-    text_summary = f"Clinical Trial Summary: {st.session_state.current_nct_id}\n"
-    text_summary += f"URL: https://clinicaltrials.gov/study/{st.session_state.current_nct_id}\n\n"
-    text_summary += st.session_state.current_summary
-    
-    st.sidebar.download_button(
-        label="📝 Text Download",
-        data=text_summary.encode('utf-8'),
-        file_name=f"clinical_trial_summary_{st.session_state.current_nct_id}.txt",
-        mime="text/plain",
-        key="sidebar_text_download"
-    )
+    # Raw data downloads if available
+    if hasattr(st.session_state, 'raw_json_data') and st.session_state.raw_json_data:
+        st.sidebar.markdown("### 🗂️ Raw Data Downloads")
+        
+        import json
+        
+        # Raw JSON
+        raw_json_str = json.dumps(st.session_state.raw_json_data, indent=2, ensure_ascii=False)
+        st.sidebar.download_button(
+            label="📋 Raw JSON Data",
+            data=raw_json_str.encode('utf-8'),
+            file_name=f"raw_study_data_{st.session_state.current_nct_id}.json",
+            mime="application/json",
+            key="sidebar_raw_json_download"
+        )
+        
+        # Processed data if available
+        if hasattr(st.session_state, 'processed_data') and st.session_state.processed_data:
+            processed_json_str = json.dumps(st.session_state.processed_data, indent=2, ensure_ascii=False)
+            st.sidebar.download_button(
+                label="⚙️ Processed Data",
+                data=processed_json_str.encode('utf-8'),
+                file_name=f"processed_data_{st.session_state.current_nct_id}.json",
+                mime="application/json",
+                key="sidebar_processed_data_download"
+            )
+        
+        # Current conversation for follow-up context
+        conversation_data = {
+            "nct_id": st.session_state.current_nct_id,
+            "conversation_id": st.session_state.current_convo_id,
+            "messages": st.session_state.messages,
+            "exported_at": "2025-09-07"
+        }
+        conversation_str = json.dumps(conversation_data, indent=2, ensure_ascii=False)
+        st.sidebar.download_button(
+            label="💬 Conversation Data",
+            data=conversation_str.encode('utf-8'),
+            file_name=f"conversation_{st.session_state.current_nct_id}.json",
+            mime="application/json",
+            key="sidebar_conversation_download"
+        )
     
     if st.session_state.current_nct_id and st.session_state.current_nct_id != 'N/A':
         st.sidebar.markdown(f"**<a href='https://clinicaltrials.gov/study/{st.session_state.current_nct_id}' target='_blank'>🔗 View on ClinicalTrials.gov</a>**", unsafe_allow_html=True)
@@ -735,7 +794,7 @@ if url_input and nct_match and not st.session_state.messages:
     nct_number = nct_match.group(0)
     st.info(f"Found NCT number: **{nct_number}**. Fetching protocol details...")
     
-    data_to_summarize, nct_id, fetch_error = get_protocol_data(nct_number)
+    data_to_summarize, nct_id, fetch_error, raw_study_data = get_protocol_data(nct_number)
 
     if fetch_error:
         st.error(fetch_error)
@@ -769,7 +828,7 @@ if url_input and nct_match and not st.session_state.messages:
             
             concise_prompt = f"""Generate a concise, well-formatted clinical trial summary using ONLY the information provided below. Follow this structure and format:
 
-# Clinical Trial Summary: {nct_id}
+# Clinical Trial Summary
 ## {data_to_summarize.get('Study Overview', '').split('|')[0].strip() if data_to_summarize.get('Study Overview') else 'Clinical Trial Protocol'}
 
 ### Study Overview
@@ -796,7 +855,8 @@ if url_input and nct_match and not st.session_state.messages:
 {consolidated_content}
 
 **Formatting Requirements:**
-- Start with the NCT ID and study title as shown above
+- Start with just "Clinical Trial Summary" as the main heading (NCT ID will be in header)
+- Use the study title as the secondary heading
 - Use clear section headers (###)
 - Keep each section to 1-3 sentences or a simple table
 - Use bullet points for lists
@@ -827,17 +887,24 @@ if url_input and nct_match and not st.session_state.messages:
         st.session_state.current_nct_id = nct_id
         st.session_state.current_study_title = data_to_summarize.get("Study Overview", "").split("|")[0].strip() if data_to_summarize.get("Study Overview") else ""
         
+        # Store raw data for download options
+        st.session_state.raw_json_data = raw_study_data  # Complete API response
+        st.session_state.processed_data = data_to_summarize  # Data sent to GPT-4o
+        st.session_state.consolidated_content = consolidated_content  # Exact content sent for summarization
+        
         save_message_to_db(st.session_state.current_convo_id, "assistant", full_summary)
         
         # Provide immediate download options after summary generation
         st.markdown("---")
-        col1, col2, col3 = st.columns(3)
+        st.markdown("### 📥 Download Options")
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
             try:
                 pdf_data = create_summary_pdf(full_summary, nct_id)
                 st.download_button(
-                    label="📄 Download PDF",
+                    label="📄 Summary PDF",
                     data=pdf_data,
                     file_name=f"clinical_trial_summary_{nct_id}.pdf",
                     mime="application/pdf",
@@ -853,7 +920,7 @@ if url_input and nct_match and not st.session_state.messages:
             text_summary += full_summary
             
             st.download_button(
-                label="📝 Download Text",
+                label="📝 Summary Text",
                 data=text_summary.encode('utf-8'),
                 file_name=f"clinical_trial_summary_{nct_id}.txt",
                 mime="text/plain",
@@ -861,8 +928,109 @@ if url_input and nct_match and not st.session_state.messages:
             )
         
         with col3:
-            if nct_id and nct_id != 'N/A':
-                st.markdown(f"**<a href='https://clinicaltrials.gov/study/{nct_id}' target='_blank'>🔗 View Full Protocol</a>**", unsafe_allow_html=True)
+            # Raw JSON data download
+            import json
+            raw_json_str = json.dumps(raw_study_data, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="🗂️ Raw JSON",
+                data=raw_json_str.encode('utf-8'),
+                file_name=f"raw_study_data_{nct_id}.json",
+                mime="application/json",
+                key="main_raw_json_download"
+            )
+        
+        with col4:
+            # Processed data sent to GPT-4o
+            processed_json_str = json.dumps(data_to_summarize, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="⚙️ Processed Data",
+                data=processed_json_str.encode('utf-8'),
+                file_name=f"processed_data_{nct_id}.json",
+                mime="application/json",
+                key="main_processed_data_download"
+            )
+        
+        with col5:
+            # GPT-4o input content
+            gpt_input_data = {
+                "prompt_template": concise_prompt,
+                "consolidated_content": consolidated_content,
+                "model": "gpt-4o",
+                "temperature": 0.3,
+                "nct_id": nct_id
+            }
+            gpt_input_str = json.dumps(gpt_input_data, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="🤖 GPT Input",
+                data=gpt_input_str.encode('utf-8'),
+                file_name=f"gpt_input_{nct_id}.json",
+                mime="application/json",
+                key="main_gpt_input_download"
+            )
+        
+        # Additional info section
+        st.markdown("**Data Sources:**")
+        if nct_id and nct_id != 'N/A':
+            st.markdown(f"🔗 [View Full Protocol on ClinicalTrials.gov](https://clinicaltrials.gov/study/{nct_id})")
+        
+        # Additional comprehensive download option
+        st.markdown("---")
+        st.markdown("### 📦 Comprehensive Data Package")
+        
+        # Create a comprehensive data package
+        comprehensive_data = {
+            "metadata": {
+                "nct_id": nct_id,
+                "export_date": "2025-09-07",
+                "api_version": "ClinicalTrials.gov API v2",
+                "processing_model": "GPT-4o",
+                "app_version": "v1.0"
+            },
+            "raw_api_response": raw_study_data,
+            "processed_extraction": data_to_summarize,
+            "gpt_input": {
+                "prompt": concise_prompt,
+                "consolidated_content": consolidated_content,
+                "model_parameters": {
+                    "model": "gpt-4o",
+                    "temperature": 0.3
+                }
+            },
+            "ai_generated_summary": full_summary,
+            "conversation_history": st.session_state.messages
+        }
+        
+        import json
+        comprehensive_json = json.dumps(comprehensive_data, indent=2, ensure_ascii=False)
+        
+        st.download_button(
+            label="📦 Download Complete Data Package",
+            data=comprehensive_json.encode('utf-8'),
+            file_name=f"complete_study_package_{nct_id}.json",
+            mime="application/json",
+            key="comprehensive_download",
+            help="Contains all raw data, processed data, AI inputs, and outputs in one file"
+        )
+        
+        # File descriptions
+        with st.expander("📋 File Descriptions"):
+            st.markdown("""
+            **Summary Files:**
+            - **Summary PDF/Text**: The final AI-generated summary in readable format
+            
+            **Raw Data Files:**
+            - **Raw JSON**: Complete unprocessed data from ClinicalTrials.gov API v2
+            - **Processed Data**: Structured data extracted and organized for AI processing
+            - **GPT Input**: Exact prompt and data sent to GPT-4o for summarization
+            - **Complete Package**: All data, processing steps, and outputs in one comprehensive file
+            
+            **Use Cases:**
+            - Research transparency and reproducibility
+            - Data analysis and custom processing
+            - Follow-up question context verification
+            - AI prompt engineering and optimization
+            """)
+        
             
 # Handle follow-up chat input
 if prompt := st.chat_input("Ask a follow-up question about the study..."):
