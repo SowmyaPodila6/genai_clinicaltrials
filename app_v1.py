@@ -1007,7 +1007,10 @@ if url_input and nct_match and not st.session_state.messages:
 ## {data_to_summarize.get('Study Overview', '').split('|')[0].strip() if data_to_summarize.get('Study Overview') else 'Clinical Trial Protocol'}
 
 ### Study Overview
-[Extract phase, design, and brief description - 2-3 sentences max]
+- Disease: [Extract disease information]
+- Phase: [Extract phase information]
+- Design: [Extract design information]
+- Brief Description: [Extract brief description - 2-3 sentences max]
 
 ### Primary Objectives
 [List main safety and/or efficacy endpoints - bullet points, be specific]
