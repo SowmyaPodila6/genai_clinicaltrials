@@ -49,20 +49,21 @@ def load_messages_from_db():
 def get_protocol_text(nct_number):
     try:
         ct = ClinicalTrials()
-        # Updated to use valid fields for the JSON format
-        study_fields = ct.get_study_fields(
+        # Using get_full_studies to retrieve all available fields and avoid field validation errors
+        study_data = ct.get_full_studies(
             search_expr=f"NCTId:{nct_number}",
-            fields=["NCTId", "OfficialTitle", "BriefSummary", "DetailedDescription"],
             max_studies=1,
             fmt="json"
         )
-        if not study_fields:
+        if not study_data or not study_data.get('studies'):
             return None, "Error: Could not retrieve study data for this NCT number."
-        study_data = study_fields[0]
-        nct_id = study_data.get('NCTId')
-        official_title = study_data.get('OfficialTitle')
-        brief_summary = study_data.get('BriefSummary')
-        detailed_description = study_data.get('DetailedDescription')
+
+        study = study_data['studies'][0]['protocolSection']
+        
+        nct_id = study['identificationModule'].get('nctId', 'N/A')
+        official_title = study['identificationModule'].get('officialTitle', 'N/A')
+        brief_summary = study['descriptionModule'].get('briefSummary', 'N/A')
+        detailed_description = study['descriptionModule'].get('detailedDescription', 'N/A')
         
         protocol_text = f"**NCT ID:** {nct_id}\n\n**Official Title:** {official_title}\n\n**Brief Summary:**\n{brief_summary}\n\n**Detailed Description:**\n{detailed_description}"
         return protocol_text, None
