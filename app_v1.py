@@ -701,13 +701,14 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Show persistent download options if a summary exists in this conversation
+# Show persistent download options in main chat area if a summary exists
 if hasattr(st.session_state, 'current_summary') and st.session_state.current_summary:
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 📥 Download Current Summary")
+    st.markdown("---")
+    st.markdown("### 📥 Download Options")
     
     # Summary downloads
-    col1, col2 = st.sidebar.columns(2)
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
     with col1:
         # PDF Download
         try:
@@ -715,15 +716,15 @@ if hasattr(st.session_state, 'current_summary') and st.session_state.current_sum
                 st.session_state.current_summary, 
                 st.session_state.current_nct_id
             )
-            st.sidebar.download_button(
-                label="📄 PDF",
+            st.download_button(
+                label="📄 Summary PDF",
                 data=pdf_data,
                 file_name=f"clinical_trial_summary_{st.session_state.current_nct_id}.pdf",
                 mime="application/pdf",
-                key="sidebar_pdf_download"
+                key="persistent_pdf_download"
             )
         except Exception as e:
-            st.sidebar.error("PDF error")
+            st.error("PDF generation error")
     
     with col2:
         # Text Download
@@ -731,59 +732,107 @@ if hasattr(st.session_state, 'current_summary') and st.session_state.current_sum
         text_summary += f"URL: https://clinicaltrials.gov/study/{st.session_state.current_nct_id}\n\n"
         text_summary += st.session_state.current_summary
         
-        st.sidebar.download_button(
-            label="📝 Text",
+        st.download_button(
+            label="📝 Summary Text",
             data=text_summary.encode('utf-8'),
             file_name=f"clinical_trial_summary_{st.session_state.current_nct_id}.txt",
             mime="text/plain",
-            key="sidebar_text_download"
+            key="persistent_text_download"
         )
     
     # Raw data downloads if available
     if hasattr(st.session_state, 'raw_json_data') and st.session_state.raw_json_data:
-        st.sidebar.markdown("### 🗂️ Raw Data Downloads")
-        
         import json
         
-        # Raw JSON
-        raw_json_str = json.dumps(st.session_state.raw_json_data, indent=2, ensure_ascii=False)
-        st.sidebar.download_button(
-            label="📋 Raw JSON Data",
-            data=raw_json_str.encode('utf-8'),
-            file_name=f"raw_study_data_{st.session_state.current_nct_id}.json",
-            mime="application/json",
-            key="sidebar_raw_json_download"
-        )
-        
-        # Processed data if available
-        if hasattr(st.session_state, 'processed_data') and st.session_state.processed_data:
-            processed_json_str = json.dumps(st.session_state.processed_data, indent=2, ensure_ascii=False)
-            st.sidebar.download_button(
-                label="⚙️ Processed Data",
-                data=processed_json_str.encode('utf-8'),
-                file_name=f"processed_data_{st.session_state.current_nct_id}.json",
+        with col3:
+            # Raw JSON
+            raw_json_str = json.dumps(st.session_state.raw_json_data, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="�️ Raw JSON",
+                data=raw_json_str.encode('utf-8'),
+                file_name=f"raw_study_data_{st.session_state.current_nct_id}.json",
                 mime="application/json",
-                key="sidebar_processed_data_download"
+                key="persistent_raw_json_download"
             )
         
-        # Current conversation for follow-up context
-        conversation_data = {
-            "nct_id": st.session_state.current_nct_id,
-            "conversation_id": st.session_state.current_convo_id,
-            "messages": st.session_state.messages,
-            "exported_at": "2025-09-07"
-        }
-        conversation_str = json.dumps(conversation_data, indent=2, ensure_ascii=False)
-        st.sidebar.download_button(
-            label="💬 Conversation Data",
-            data=conversation_str.encode('utf-8'),
-            file_name=f"conversation_{st.session_state.current_nct_id}.json",
-            mime="application/json",
-            key="sidebar_conversation_download"
-        )
+        with col4:
+            # Processed data if available
+            if hasattr(st.session_state, 'processed_data') and st.session_state.processed_data:
+                processed_json_str = json.dumps(st.session_state.processed_data, indent=2, ensure_ascii=False)
+                st.download_button(
+                    label="⚙️ Processed Data",
+                    data=processed_json_str.encode('utf-8'),
+                    file_name=f"processed_data_{st.session_state.current_nct_id}.json",
+                    mime="application/json",
+                    key="persistent_processed_data_download"
+                )
+        
+        with col5:
+            # Current conversation for follow-up context
+            conversation_data = {
+                "nct_id": st.session_state.current_nct_id,
+                "conversation_id": st.session_state.current_convo_id,
+                "messages": st.session_state.messages,
+                "exported_at": "2025-09-07"
+            }
+            conversation_str = json.dumps(conversation_data, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="💬 Conversation",
+                data=conversation_str.encode('utf-8'),
+                file_name=f"conversation_{st.session_state.current_nct_id}.json",
+                mime="application/json",
+                key="persistent_conversation_download"
+            )
     
-    if st.session_state.current_nct_id and st.session_state.current_nct_id != 'N/A':
-        st.sidebar.markdown(f"**<a href='https://clinicaltrials.gov/study/{st.session_state.current_nct_id}' target='_blank'>🔗 View on ClinicalTrials.gov</a>**", unsafe_allow_html=True)
+    # Additional options
+    st.markdown("#### Additional Options")
+    col_a, col_b = st.columns(2)
+    
+    with col_a:
+        if st.session_state.current_nct_id and st.session_state.current_nct_id != 'N/A':
+            st.markdown(f"🔗 [View Full Protocol on ClinicalTrials.gov](https://clinicaltrials.gov/study/{st.session_state.current_nct_id})")
+    
+    with col_b:
+        # Complete package download if raw data available
+        if hasattr(st.session_state, 'raw_json_data') and st.session_state.raw_json_data:
+            comprehensive_data = {
+                "metadata": {
+                    "nct_id": st.session_state.current_nct_id,
+                    "export_date": "2025-09-07",
+                    "api_version": "ClinicalTrials.gov API v2",
+                    "processing_model": "GPT-4o",
+                    "app_version": "v1.0"
+                },
+                "raw_api_response": st.session_state.raw_json_data,
+                "processed_extraction": st.session_state.processed_data if hasattr(st.session_state, 'processed_data') else None,
+                "ai_generated_summary": st.session_state.current_summary,
+                "conversation_history": st.session_state.messages
+            }
+            
+            comprehensive_json = json.dumps(comprehensive_data, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="📦 Complete Package",
+                data=comprehensive_json.encode('utf-8'),
+                file_name=f"complete_study_package_{st.session_state.current_nct_id}.json",
+                mime="application/json",
+                key="persistent_comprehensive_download",
+                help="All data, processing steps, and outputs in one file"
+            )
+    
+    # File descriptions
+    with st.expander("📋 What's in each download?"):
+        st.markdown("""
+        **Summary Files:**
+        - **Summary PDF/Text**: AI-generated summary in readable format
+        
+        **Data Files:**
+        - **Raw JSON**: Complete unprocessed ClinicalTrials.gov data
+        - **Processed Data**: Structured data extracted for AI processing
+        - **Conversation**: Chat history and follow-up context
+        - **Complete Package**: Everything in one comprehensive file
+        """)
+    
+    st.markdown("---")
 
 # Handle the initial URL input
 url_input = st.text_input("ClinicalTrials.gov URL:", placeholder="e.g., https://clinicaltrials.gov/study/NCT01234567", key=st.session_state.url_key)
