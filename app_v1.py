@@ -57,7 +57,7 @@ def get_all_conversations():
 
 # --- App Logic ---
 
-def get_protocol_text(nct_number):
+def get_protocol_data(nct_number):
     try:
         api_url = f"https://clinicaltrials.gov/api/v2/studies/{nct_number}"
         response = requests.get(api_url)
@@ -65,24 +65,90 @@ def get_protocol_text(nct_number):
         
         study_data = response.json()
         
-        if 'protocolSection' not in study_data:
-            return None, "Error: Study data could not be found for this NCT number."
+        protocol_section = study_data.get('protocolSection', {})
+        results_section = study_data.get('resultsSection', {})
 
-        study = study_data['protocolSection']
+        if not protocol_section:
+            return None, None, "Error: Study data could not be found for this NCT number."
+
+        # Identification Module
+        identification_module = protocol_section.get('identificationModule', {})
+        nct_id = identification_module.get('nctId', 'N/A')
+        official_title = identification_module.get('officialTitle', 'N/A')
+
+        # Status Module
+        status_module = protocol_section.get('statusModule', {})
+        overall_status = status_module.get('overallStatus', 'N/A')
         
-        nct_id = study['identificationModule'].get('nctId', 'N/A')
-        official_title = study['identificationModule'].get('officialTitle', 'N/A')
-        brief_summary = study['descriptionModule'].get('briefSummary', 'N/A')
-        detailed_description = study['descriptionModule'].get('detailedDescription', 'N/A')
+        # Description Module
+        description_module = protocol_section.get('descriptionModule', {})
+        brief_summary = description_module.get('briefSummary', 'N/A')
+        detailed_description = description_module.get('detailedDescription', 'N/A')
         
-        protocol_text = f"**NCT ID:** {nct_id}\n\n**Official Title:** {official_title}\n\n**Brief Summary:**\n{brief_summary}\n\n**Detailed Description:**\n{detailed_description}"
-        return protocol_text, None
+        # Design Module
+        design_module = protocol_section.get('designModule', {})
+        study_type = design_module.get('studyType', 'N/A')
+        
+        # Interventions and Arm Groups
+        arms_interventions_module = protocol_section.get('armsInterventionsModule', {})
+        arm_groups_list = arms_interventions_module.get('armGroups', [])
+        arm_groups_text = "\n".join([f"- ID: {ag.get('armGroupId', 'N/A')}\n  Title: {ag.get('armGroupLabel', 'N/A')}\n  Description: {ag.get('armGroupDescription', 'N/A')}" for ag in arm_groups_list])
+        
+        interventions_list = arms_interventions_module.get('interventions', [])
+        interventions_text = "\n".join([f"- Name: {i.get('interventionName', 'N/A')}\n  Type: {i.get('interventionType', 'N/A')}" for i in interventions_list])
+
+        # Eligibility Module
+        eligibility_module = protocol_section.get('eligibilityModule', {})
+        eligibility_criteria = eligibility_module.get('eligibilityCriteria', {}).get('textblock', 'N/A')
+        
+        # Outcomes Module
+        outcomes_module = protocol_section.get('outcomesModule', {})
+        outcomes_list = outcomes_module.get('primaryOutcomes', []) + outcomes_module.get('secondaryOutcomes', [])
+        outcomes_text = "\n".join([f"- Measure: {o.get('outcomeMeasure', 'N/A')}\n  Description: {o.get('outcomeDescription', 'N/A')}" for o in outcomes_list])
+
+        # Adverse Events (from resultsSection)
+        adverse_events_module = results_section.get('adverseEventsModule', {})
+        serious_events = adverse_events_module.get('seriousEvents', [])
+        other_events = adverse_events_module.get('otherEvents', [])
+        
+        adverse_events_text = ""
+        if serious_events or other_events:
+            if serious_events:
+                adverse_events_text += "\n**Serious Adverse Events:**\n"
+                for event in serious_events:
+                    term = event.get('adverseEventTerm', 'N/A')
+                    organ_system = event.get('adverseEventOrganSystem', 'N/A')
+                    adverse_events_text += f"- Term: {term}, Organ System: {organ_system}\n"
+            if other_events:
+                adverse_events_text += "\n**Other Adverse Events:**\n"
+                for event in other_events:
+                    term = event.get('adverseEventTerm', 'N/A')
+                    organ_system = event.get('adverseEventOrganSystem', 'N/A')
+                    adverse_events_text += f"- Term: {term}, Organ System: {organ_system}\n"
+        else:
+            adverse_events_text = "No adverse events reported."
+
+        # Structured data for section-wise summarization
+        data_to_summarize = {
+            "Official Title": official_title,
+            "Overall Status": overall_status,
+            "Study Type": study_type,
+            "Brief Summary": brief_summary,
+            "Detailed Description": detailed_description,
+            "Study Arms and Treatment Plans": arm_groups_text,
+            "Interventions": interventions_text,
+            "Eligibility Criteria": eligibility_criteria,
+            "Outcomes": outcomes_text,
+            "Adverse Events": adverse_events_text
+        }
+
+        return data_to_summarize, None, None
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
-            return None, f"Error: Study with NCT number {nct_number} was not found on ClinicalTrials.gov."
-        return None, f"HTTP error occurred while fetching the protocol: {e}"
+            return None, None, f"Error: Study with NCT number {nct_number} was not found on ClinicalTrials.gov."
+        return None, None, f"HTTP error occurred while fetching the protocol: {e}"
     except Exception as e:
-        return None, f"An error occurred while fetching the protocol: {e}"
+        return None, None, f"An error occurred while fetching the protocol: {e}"
 
 def summarize_with_gpt4o(messages):
     try:
@@ -106,7 +172,8 @@ def new_chat_click():
     st.session_state.url_key = str(uuid.uuid4())
     st.rerun()
 
-st.title("Clinical Trial Protocol Summarizer Chatbot (SQLite)")
+st.title("Gen AI-Powered Clinical Protocol Summarizer")
+st.markdown("Enter a ClinicalTrials.gov URL below to get a section-by-section summary of the study. You can then ask follow-up questions about the protocol.")
 
 st.sidebar.header("Past Chats")
 conversations = get_all_conversations()
@@ -117,8 +184,6 @@ for convo_id in conversations:
         st.rerun()
 
 st.sidebar.button("Start New Chat", key="new_chat_button", on_click=new_chat_click)
-
-st.markdown("Enter a ClinicalTrials.gov URL to start a conversation about the study.")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -141,13 +206,11 @@ if url_input and nct_match and not st.session_state.messages:
     nct_number = nct_match.group(0)
     st.info(f"Found NCT number: **{nct_number}**. Fetching protocol details...")
     
-    protocol_text, fetch_error = get_protocol_text(nct_number)
+    data_to_summarize, _, fetch_error = get_protocol_data(nct_number)
 
     if fetch_error:
         st.error(fetch_error)
-    elif protocol_text:
-        initial_prompt = f"Please summarize the following clinical trial protocol and be ready to answer follow-up questions about it:\n\n{protocol_text}"
-        
+    elif data_to_summarize:
         st.session_state.messages.append({"role": "user", "content": f"URL: {url_input}"})
         with st.chat_message("user"):
             st.markdown(f"URL: {url_input}")
@@ -155,24 +218,30 @@ if url_input and nct_match and not st.session_state.messages:
             
         st.success("Protocol details fetched successfully! Generating summary...")
         
-        with st.spinner("Summarizing protocol with GPT-4o..."):
-            messages_for_api = [
-                {"role": "system", "content": "You are a medical summarization assistant. Provide a concise and clear summary of a clinical trial protocol, highlighting the study's purpose, design, interventions, and key outcomes. After the initial summary, answer follow-up questions based on the provided protocol text. Do not invent information."},
-                {"role": "user", "content": initial_prompt}
-            ]
-            summary, summary_error = summarize_with_gpt4o(messages_for_api)
+        full_summary = ""
+        for section, text_content in data_to_summarize.items():
+            if text_content:
+                with st.spinner(f"Summarizing '{section}'..."):
+                    initial_prompt = f"Please provide a concise summary of the following section from a clinical trial protocol:\n\n**Section:** {section}\n**Content:** {text_content}"
+                    
+                    messages_for_api = [
+                        {"role": "system", "content": "You are a medical summarization assistant. Provide a concise and clear summary of the provided text, focusing on the key information for the given section. Do not invent information."},
+                        {"role": "user", "content": initial_prompt}
+                    ]
+                    
+                    section_summary, summary_error = summarize_with_gpt4o(messages_for_api)
 
-        if summary_error:
-            st.error(summary_error)
-        else:
-            st.session_state.messages.append({"role": "assistant", "content": summary})
-            with st.chat_message("assistant"):
-                st.markdown(summary)
-            
-            with st.expander("See Original Protocol Text"):
-                st.text(protocol_text)
-            
-            save_message_to_db(st.session_state.current_convo_id, "assistant", summary)
+                if summary_error:
+                    st.error(summary_error)
+                    full_summary += f"### **{section}**\n\n_Summary failed due to an error._\n\n"
+                else:
+                    full_summary += f"### **{section}**\n\n{section_summary}\n\n"
+        
+        st.session_state.messages.append({"role": "assistant", "content": full_summary})
+        with st.chat_message("assistant"):
+            st.markdown(full_summary)
+        
+        save_message_to_db(st.session_state.current_convo_id, "assistant", full_summary)
             
 # Handle follow-up chat input
 if prompt := st.chat_input("Ask a follow-up question about the study..."):
