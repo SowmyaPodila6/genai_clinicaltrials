@@ -1,50 +1,52 @@
 """
-Simple LangGraph Workflow for Clinical Trial Analysis
-Following official LangGraph documentation patterns
-Integrated with app_v1.py functionality
+LangGraph Workflow for Clinical Trial Analysis
+Clean, production-ready implementation following official LangGraph patterns
 """
 
-from typing import TypedDict, Annotated, Literal, Iterator
+from typing import TypedDict, Literal, Iterator
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessageChunk
+from langchain_core.messages import HumanMessage, SystemMessage
 import json
 import re
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
-import os
 
-# Import existing parsers (ClinicalTrialPDFParser is in clinical_trail_parser)
+# Import local modules
 from clinical_trail_parser import ClinicalTrialPDFParser, map_sections_to_schema
+from prompts import (
+    SUMMARIZATION_SYSTEM_PROMPT, 
+    SUMMARY_GENERATION_TEMPLATE,
+    QA_SYSTEM_PROMPT,
+    QA_TEMPLATE
+)
+from utils import calculate_metrics, filter_meaningful_sections, create_consolidated_content
 
 load_dotenv()
 
 # Initialize LLM with streaming support
 llm = ChatOpenAI(model="gpt-4o", temperature=0.1, streaming=True)
 
-# System message for GPT-4 summarization (from app_v1)
-SYSTEM_MESSAGE = "You are a clinical research summarization expert. Create concise, well-formatted summaries that focus only on available information. Avoid filler text and sections with insufficient data. Use clear markdown formatting and keep summaries under 400 words while including all key available information."
 
 class WorkflowState(TypedDict):
-    """State for the workflow following LangGraph patterns"""
+    """State for the workflow"""
     input_url: str
     input_type: Literal["pdf", "url", "unknown"]
-    raw_data: dict  # Raw API response or PDF data
-    parsed_json: dict  # Structured 9-field schema
-    data_to_summarize: dict  # Formatted for GPT (like app_v1)
+    raw_data: dict
+    parsed_json: dict
+    data_to_summarize: dict
     confidence_score: float
     completeness_score: float
     missing_fields: list
     nct_id: str
     chat_query: str
     chat_response: str
-    stream_response: Iterator  # For streaming
     error: str
 
 
 def classify_input(state: WorkflowState) -> WorkflowState:
-    """Node: Classify input as PDF or URL (same logic as app_v1)"""
+    """Node: Classify input as PDF or URL"""
     input_url = state["input_url"]
     
     if input_url.lower().endswith('.pdf') or 'pdf' in input_url.lower():
@@ -69,7 +71,7 @@ def route_input(state: WorkflowState) -> Literal["pdf_parser", "url_extractor", 
 
 
 def parse_pdf(state: WorkflowState) -> WorkflowState:
-    """Node: Parse PDF document using enhanced_parser (same as app_v1)"""
+    """Node: Parse PDF document"""
     try:
         parser = ClinicalTrialPDFParser()
         
@@ -84,9 +86,9 @@ def parse_pdf(state: WorkflowState) -> WorkflowState:
         # Map to schema (9 fields)
         parsed_schema = map_sections_to_schema(sections)
         state["parsed_json"] = parsed_schema
-        state["raw_data"] = {"sections": sections}  # Store raw sections
+        state["raw_data"] = {"sections": sections}
         
-        # Convert to app_v1 format for summarization
+        # Convert to summarization format
         state["data_to_summarize"] = {
             "Study Overview": parsed_schema.get("study_overview", ""),
             "Brief Description": parsed_schema.get("brief_description", ""),
@@ -110,7 +112,7 @@ def parse_pdf(state: WorkflowState) -> WorkflowState:
 
 
 def extract_from_url(state: WorkflowState) -> WorkflowState:
-    """Node: Extract data from ClinicalTrials.gov URL (EXACT copy of app_v1 get_protocol_data)"""
+    """Node: Extract data from ClinicalTrials.gov URL"""
     try:
         # Extract NCT number
         nct_match = re.search(r"NCT\d{8}", state["input_url"])
@@ -121,7 +123,7 @@ def extract_from_url(state: WorkflowState) -> WorkflowState:
         nct_number = nct_match.group(0)
         state["nct_id"] = nct_number
         
-        # Fetch from API (same as app_v1)
+        # Fetch from API
         api_url = f"https://clinicaltrials.gov/api/v2/studies/{nct_number}"
         response = requests.get(api_url)
         response.raise_for_status()
@@ -136,8 +138,7 @@ def extract_from_url(state: WorkflowState) -> WorkflowState:
             state["error"] = "Error: Study data could not be found for this NCT number."
             return state
 
-        # Extract all data EXACTLY as in app_v1.py
-        # (This is a condensed version - the full extraction logic from app_v1)
+        # Extract key sections
         identification_module = protocol_section.get('identificationModule', {})
         official_title = identification_module.get('officialTitle', 'N/A')
         
@@ -233,7 +234,7 @@ def extract_from_url(state: WorkflowState) -> WorkflowState:
         sponsor_class = lead_sponsor.get('class', 'N/A')
         sponsor_info = f"Lead Sponsor: {sponsor_name} ({sponsor_class})"
         
-        # Create data_to_summarize dict (same format as app_v1)
+        # Create data_to_summarize dict
         data_to_summarize = {
             "Study Overview": f"{official_title} | Status: {overall_status} | Type: {study_type} - {study_phase}",
             "Brief Description": brief_summary,
@@ -247,7 +248,7 @@ def extract_from_url(state: WorkflowState) -> WorkflowState:
         }
         
         state["data_to_summarize"] = data_to_summarize
-        state["parsed_json"] = data_to_summarize  # For consistency
+        state["parsed_json"] = data_to_summarize
         
         # Calculate metrics
         state["confidence_score"], state["completeness_score"], state["missing_fields"] = calculate_metrics(data_to_summarize)
@@ -261,41 +262,6 @@ def extract_from_url(state: WorkflowState) -> WorkflowState:
         state["error"] = f"An error occurred while fetching the protocol: {e}"
     
     return state
-
-
-def calculate_metrics(parsed_json: dict) -> tuple[float, float, list]:
-    """Calculate confidence and completeness scores"""
-    required_fields = [
-        "study_overview",
-        "brief_description",
-        "primary_secondary_objectives",
-        "treatment_arms_interventions",
-        "eligibility_criteria",
-        "enrollment_participant_flow",
-        "adverse_events_profile",
-        "study_locations",
-        "sponsor_information"
-    ]
-    
-    filled_fields = 0
-    missing_fields = []
-    total_content = 0
-    
-    for field in required_fields:
-        content = parsed_json.get(field, "")
-        if content and len(content.strip()) > 20:
-            filled_fields += 1
-            total_content += len(content)
-        else:
-            missing_fields.append(field)
-    
-    completeness_score = filled_fields / len(required_fields)
-    
-    # Confidence based on content richness
-    avg_content_length = total_content / max(filled_fields, 1)
-    confidence_score = min(1.0, avg_content_length / 500)
-    
-    return confidence_score, completeness_score, missing_fields
 
 
 def check_quality(state: WorkflowState) -> Literal["llm_fallback", "chat_node"]:
@@ -314,9 +280,10 @@ def llm_fallback(state: WorkflowState) -> WorkflowState:
             parser = ClinicalTrialPDFParser()
             if state["input_url"].startswith('http'):
                 response = requests.get(state["input_url"])
-                full_text = parser.extract_text_from_bytes(response.content)
+                sections = parser.parse_pdf_bytes(response.content)
             else:
-                full_text = parser.extract_text_with_pdfplumber(state["input_url"])
+                sections = parser.parse_pdf(state["input_url"])
+            full_text = json.dumps(sections, indent=2)
         else:
             full_text = json.dumps(state["raw_data"], indent=2)
         
@@ -349,13 +316,13 @@ Return as JSON."""
         try:
             llm_extracted = json.loads(response.content)
             # Merge with existing data
-            state["parsed_json"].update(llm_extracted)
+            state["data_to_summarize"].update(llm_extracted)
         except json.JSONDecodeError:
             # Fallback: use as-is
-            state["parsed_json"]["llm_extracted_content"] = response.content
+            pass
         
         # Recalculate metrics
-        state["confidence_score"], state["completeness_score"], state["missing_fields"] = calculate_metrics(state["parsed_json"])
+        state["confidence_score"], state["completeness_score"], state["missing_fields"] = calculate_metrics(state["data_to_summarize"])
         
     except Exception as e:
         state["error"] = f"LLM fallback error: {str(e)}"
@@ -364,94 +331,42 @@ Return as JSON."""
 
 
 def chat_node(state: WorkflowState) -> WorkflowState:
-    """Node: Handle chat interactions with Q&A (with streaming support like app_v1)"""
+    """Node: Handle chat interactions with Q&A"""
     try:
         query = state.get("chat_query", "")
         
         if not query or query == "generate_summary":
-            # Generate initial summary using EXACT app_v1 prompt
+            # Generate initial summary
             data_to_summarize = state["data_to_summarize"]
+            sections_to_include = filter_meaningful_sections(data_to_summarize)
+            consolidated_content = create_consolidated_content(sections_to_include)
             
-            # Filter sections with meaningful content (same as app_v1)
-            sections_to_include = {}
-            for section, content in data_to_summarize.items():
-                if (content and 
-                    content != "N/A" and 
-                    isinstance(content, str) and
-                    "No " not in content[:20] and
-                    "not available" not in content.lower() and
-                    len(content.strip()) > 30):
-                    sections_to_include[section] = content
-            
-            # Prepare consolidated content
-            consolidated_content = ""
-            for section, content in sections_to_include.items():
-                consolidated_content += f"\n\n**{section}:**\n{content}\n"
-            
-            # EXACT prompt from app_v1
             study_title = data_to_summarize.get('Study Overview', '').split('|')[0].strip() if data_to_summarize.get('Study Overview') else 'Clinical Trial Protocol'
             
-            concise_prompt = f"""Generate a concise, well-formatted clinical trial summary using ONLY the information provided below. Follow this structure and format:
-
-# Clinical Trial Summary
-## {study_title}
-
-### Study Overview
-- Disease: [Extract disease information]
-- Phase: [Extract phase information]
-- Design: [Extract design information]
-- Brief Description: [Extract brief description - 2-3 sentences max]
-
-
-### Primary Objectives
-[List main safety and/or efficacy endpoints - bullet points, be specific]
-
-### Treatment Arms & Interventions
-[Create a simple table if multiple arms exist, otherwise describe briefly]
-
-### Eligibility Criteria
-#### Key inclusion criteria
-#### Key exclusion criteria
-
-### Enrollment & Participant Flow
-[Patient numbers and enrollment status if available]
-
-### Safety Profile
-[Only include if adverse events data is available - summarize key findings]
-
----
-
-**Available Data:**
-{consolidated_content}
-
-**Formatting Requirements:**
-- Start with just "Clinical Trial Summary" as the main heading (NCT ID will be in header)
-- Use the study title as the secondary heading
-- Use clear section headers (###)
-- Keep each section to 1-3 sentences or a simple table
-- Do not skip any key details if available; do not fabricate missing info; strictly summarize the content from the Protocol.
-- Use bullet points for lists
-- Only include sections where meaningful data exists
-- Skip any section that says "not available" or has insufficient information
-- Make it readable and concise - aim for 200-400 words total
-- Use markdown formatting for better readability"""
+            concise_prompt = SUMMARY_GENERATION_TEMPLATE.format(
+                study_title=study_title,
+                consolidated_content=consolidated_content
+            )
 
             messages = [
-                SystemMessage(content="You are a clinical research summarization expert. Create concise, well-formatted summaries that focus only on available information. Avoid filler text and sections with insufficient data. Use clear markdown formatting and keep summaries under 400 words while including all key available information."),
+                SystemMessage(content=SUMMARIZATION_SYSTEM_PROMPT),
                 HumanMessage(content=concise_prompt)
             ]
         else:
-            # Follow-up question handling (same as app_v1)
+            # Follow-up question handling
             context = json.dumps(state["data_to_summarize"], indent=2)
             
-            system_prompt = "You are a medical summarization assistant. Answer questions based on the provided protocol text. Do not invent information."
+            question_prompt = QA_TEMPLATE.format(
+                context=context,
+                query=query
+            )
             
             messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=f"Clinical Trial Data:\n{context}\n\nQuestion: {query}")
+                SystemMessage(content=QA_SYSTEM_PROMPT),
+                HumanMessage(content=question_prompt)
             ]
         
-        # Stream response
+        # Get response
         response_text = ""
         for chunk in llm.stream(messages):
             if hasattr(chunk, 'content'):
@@ -474,79 +389,27 @@ def chat_node_stream(state: WorkflowState) -> Iterator[str]:
         if not query or query == "generate_summary":
             # Generate initial summary
             data_to_summarize = state["data_to_summarize"]
-            
-            # Filter sections
-            sections_to_include = {}
-            for section, content in data_to_summarize.items():
-                if (content and 
-                    content != "N/A" and 
-                    isinstance(content, str) and
-                    "No " not in content[:20] and
-                    "not available" not in content.lower() and
-                    len(content.strip()) > 30):
-                    sections_to_include[section] = content
-            
-            consolidated_content = ""
-            for section, content in sections_to_include.items():
-                consolidated_content += f"\n\n**{section}:**\n{content}\n"
+            sections_to_include = filter_meaningful_sections(data_to_summarize)
+            consolidated_content = create_consolidated_content(sections_to_include)
             
             study_title = data_to_summarize.get('Study Overview', '').split('|')[0].strip() if data_to_summarize.get('Study Overview') else 'Clinical Trial Protocol'
             
-            concise_prompt = f"""Generate a concise, well-formatted clinical trial summary using ONLY the information provided below. Follow this structure and format:
-
-# Clinical Trial Summary
-## {study_title}
-
-### Study Overview
-- Disease: [Extract disease information]
-- Phase: [Extract phase information]
-- Design: [Extract design information]
-- Brief Description: [Extract brief description - 2-3 sentences max]
-
-
-### Primary Objectives
-[List main safety and/or efficacy endpoints - bullet points, be specific]
-
-### Treatment Arms & Interventions
-[Create a simple table if multiple arms exist, otherwise describe briefly]
-
-### Eligibility Criteria
-#### Key inclusion criteria
-#### Key exclusion criteria
-
-### Enrollment & Participant Flow
-[Patient numbers and enrollment status if available]
-
-### Safety Profile
-[Only include if adverse events data is available - summarize key findings]
-
----
-
-**Available Data:**
-{consolidated_content}
-
-**Formatting Requirements:**
-- Start with just "Clinical Trial Summary" as the main heading (NCT ID will be in header)
-- Use the study title as the secondary heading
-- Use clear section headers (###)
-- Keep each section to 1-3 sentences or a simple table
-- Do not skip any key details if available; do not fabricate missing info; strictly summarize the content from the Protocol.
-- Use bullet points for lists
-- Only include sections where meaningful data exists
-- Skip any section that says "not available" or has insufficient information
-- Make it readable and concise - aim for 200-400 words total
-- Use markdown formatting for better readability"""
+            concise_prompt = SUMMARY_GENERATION_TEMPLATE.format(
+                study_title=study_title,
+                consolidated_content=consolidated_content
+            )
 
             messages = [
-                SystemMessage(content="You are a clinical research summarization expert. Create concise, well-formatted summaries that focus only on available information. Avoid filler text and sections with insufficient data. Use clear markdown formatting and keep summaries under 400 words while including all key available information."),
+                SystemMessage(content=SUMMARIZATION_SYSTEM_PROMPT),
                 HumanMessage(content=concise_prompt)
             ]
         else:
+            # Follow-up question
             context = json.dumps(state["data_to_summarize"], indent=2)
-            system_prompt = "You are a medical summarization assistant. Answer questions based on the provided protocol text. Do not invent information."
+            question_prompt = QA_TEMPLATE.format(context=context, query=query)
             messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=f"Clinical Trial Data:\n{context}\n\nQuestion: {query}")
+                SystemMessage(content=QA_SYSTEM_PROMPT),
+                HumanMessage(content=question_prompt)
             ]
         
         # Stream chunks
@@ -556,39 +419,6 @@ def chat_node_stream(state: WorkflowState) -> Iterator[str]:
                 
     except Exception as e:
         yield f"Error: {str(e)}"
-
-
-def convert_api_to_schema(study_data: dict) -> dict:
-    """Convert ClinicalTrials.gov API data to standard schema (deprecated - using extract_from_url instead)"""
-    # This function is kept for backward compatibility but not used in main workflow
-    protocol = study_data.get('protocolSection', {})
-    
-    identification = protocol.get('identificationModule', {})
-    description = protocol.get('descriptionModule', {})
-    design = protocol.get('designModule', {})
-    arms = protocol.get('armsInterventionsModule', {})
-    eligibility = protocol.get('eligibilityModule', {})
-    contacts = protocol.get('contactsLocationsModule', {})
-    sponsor = protocol.get('sponsorCollaboratorsModule', {})
-    outcomes = protocol.get('outcomesModule', {})
-    
-    return {
-        "study_overview": identification.get('officialTitle', ''),
-        "brief_description": description.get('briefSummary', ''),
-        "primary_secondary_objectives": json.dumps({
-            'primary': outcomes.get('primaryOutcomes', []),
-            'secondary': outcomes.get('secondaryOutcomes', [])
-        }),
-        "treatment_arms_interventions": json.dumps({
-            'arms': arms.get('armGroups', []),
-            'interventions': arms.get('interventions', [])
-        }),
-        "eligibility_criteria": eligibility.get('eligibilityCriteria', ''),
-        "enrollment_participant_flow": json.dumps(design.get('enrollmentInfo', {})),
-        "adverse_events_profile": "Not available in protocol section",
-        "study_locations": json.dumps(contacts.get('locations', [])),
-        "sponsor_information": json.dumps(sponsor)
-    }
 
 
 # Build the graph
@@ -657,7 +487,6 @@ if __name__ == "__main__":
         "nct_id": "",
         "chat_query": "generate_summary",
         "chat_response": "",
-        "stream_response": None,
         "error": ""
     })
     

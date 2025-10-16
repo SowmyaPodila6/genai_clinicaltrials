@@ -1,8 +1,26 @@
-streamlit
-openai
-requests
-fpdf
-PyPDF2
-pdfplumber
-python-docx
-re
+# Core Dependencies
+streamlit>=1.28.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+
+# LangGraph and LangChain
+langgraph>=0.2.0
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-core>=0.1.0
+
+# PDF Processing
+PyMuPDF>=1.23.0
+pdfplumber>=0.10.0
+pdfminer.six>=20221105
+Pillow>=10.0.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# HTTP and Web
+requests>=2.31.0
+fpdf>=1.7.2
+
+# Database (sqlite3 is built-in with Python)

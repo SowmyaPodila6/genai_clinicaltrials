@@ -43,6 +43,13 @@ TEST_*.py
 # Large PDF test files (add manually if needed)
 *.pdf
 
-# Cleanup documentation (temporary)
-GIT_READY.md
-PROJECT_STRUCTURE.md
+# Backup files
+*_backup.py
+*.bak
+
+# Old/deprecated files
+app_v1.py
+app_v1_backup.py
+app_langgraph*.py
+test_*.py
+test_*.json
