@@ -7,6 +7,12 @@ import os
 import sqlite3
 import uuid
 from fpdf import FPDF
+from dotenv import load_dotenv
+from clinical_trail_parser import ClinicalTrialPDFParser, map_sections_to_schema
+
+# Load environment variables from .env file
+load_dotenv()
+
 
 # --- Mock Summary Template ---
 mock_summary_template = """
@@ -42,6 +48,7 @@ Keep summaries concise, well-formatted, and focused on available data only.
 
 # Set up the OpenAI API key from Streamlit secrets
 openai.api_key = st.secrets["OPENAI_API_KEY"]
+#openai.api_key  = os.getenv("OPENAI_API_KEY")
 
 # Define the database file
 DB_FILE = "chat_history.db"
@@ -764,17 +771,110 @@ def create_summary_pdf(summary_text, nct_id):
             # Return minimal bytes if everything fails
             return b"PDF generation failed due to encoding issues."
 
+# --- PDF Upload Handler ---
+
+def handle_pdf_upload():
+    """Handle the PDF upload, parse, and prepare for LLM summarization."""
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+    
+    if uploaded_file is not None:
+        st.info(f"Uploaded: **{uploaded_file.name}** ({uploaded_file.size} bytes)")
+        
+        with st.spinner("Parsing PDF document..."):
+            try:
+                # Parse PDF
+                parser = ClinicalTrialPDFParser()
+                pdf_bytes = uploaded_file.read()
+                sections = parser.parse_pdf_bytes(pdf_bytes)
+                
+                # Map to strict 9-field schema
+                parsed_schema = map_sections_to_schema(sections)
+                
+                # Store parsed sections in session state for follow-up questions
+                st.session_state.parsed_sections = parsed_schema
+                st.session_state.pdf_filename = uploaded_file.name
+                
+                # Add upload notification to chat
+                st.session_state.messages.append({"role": "user", "content": f"Uploaded PDF: {uploaded_file.name}"})
+                save_message_to_db(st.session_state.current_convo_id, "user", f"Uploaded PDF: {uploaded_file.name}")
+                
+                # Show confirmation message
+                confirmation_msg = f"✅ **PDF uploaded and parsed successfully!**\n\n**Document:** {uploaded_file.name}\n\n**Fields parsed:**\n"
+                for field in parsed_schema.keys():
+                    has_content = bool(parsed_schema[field].strip())
+                    status = "✓" if has_content else "✗"
+                    confirmation_msg += f"- {status} {field}\n"
+                
+                confirmation_msg += "\n**What would you like to do?**\n- Ask specific questions about the document\n- Request a full summary\n- Ask about particular sections"
+                
+                st.session_state.messages.append({"role": "assistant", "content": confirmation_msg})
+                save_message_to_db(st.session_state.current_convo_id, "assistant", confirmation_msg)
+                
+                st.success("PDF parsed successfully! Ask questions or request a summary in the chat below.")
+                
+                # Display download options for parsed JSON
+                st.markdown("---")
+                st.markdown("### 📥 Export Parsed Data")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    # Download parsed schema as JSON
+                    import json
+                    parsed_json = json.dumps(parsed_schema, indent=2, ensure_ascii=False)
+                    st.download_button(
+                        label="📄 Parsed Schema JSON",
+                        data=parsed_json.encode('utf-8'),
+                        file_name=f"parsed_{uploaded_file.name.replace('.pdf', '.json')}",
+                        mime="application/json",
+                        help="Download the 9-field schema extracted from the PDF"
+                    )
+                
+                with col2:
+                    # Download raw sections
+                    raw_sections_json = json.dumps(sections, indent=2, ensure_ascii=False)
+                    st.download_button(
+                        label="📋 Raw Sections JSON",
+                        data=raw_sections_json.encode('utf-8'),
+                        file_name=f"raw_sections_{uploaded_file.name.replace('.pdf', '.json')}",
+                        mime="application/json",
+                        help="Download all detected sections before schema mapping"
+                    )
+                
+                with col3:
+                    # Download as text file
+                    text_output = f"Parsed Clinical Trial Data: {uploaded_file.name}\n"
+                    text_output += "=" * 60 + "\n\n"
+                    for field, content in parsed_schema.items():
+                        text_output += f"## {field}\n"
+                        text_output += f"{content}\n\n"
+                    
+                    st.download_button(
+                        label="📝 Parsed Data as Text",
+                        data=text_output.encode('utf-8'),
+                        file_name=f"parsed_{uploaded_file.name.replace('.pdf', '.txt')}",
+                        mime="text/plain",
+                        help="Download the parsed data as a formatted text file"
+                    )
+                
+            except Exception as e:
+                error_msg = f"Error parsing PDF: {str(e)}"
+                st.error(error_msg)
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                save_message_to_db(st.session_state.current_convo_id, "assistant", error_msg)
+
 # --- Streamlit UI and Chat Management ---
 
 def new_chat_click():
     st.session_state.messages = []
     st.session_state.current_convo_id = str(uuid.uuid4())
     st.session_state.url_key = str(uuid.uuid4())
+    st.session_state.parsed_sections = None
     # Don't clear summary data - let users access previous summaries
     st.rerun()
 
 st.title("Gen AI-Powered Clinical Protocol Summarizer")
-st.markdown("Enter a ClinicalTrials.gov URL below to get a section-by-section summary of the study. You can then ask follow-up questions about the protocol.")
+st.markdown("Enter a ClinicalTrials.gov URL or upload a PDF document to get a section-by-section summary of the study. You can then ask follow-up questions about the protocol.")
 
 st.sidebar.header("Past Chats")
 conversations = get_all_conversations()
@@ -821,11 +921,22 @@ if "messages" not in st.session_state:
 if "current_convo_id" not in st.session_state:
     st.session_state.current_convo_id = str(uuid.uuid4())
     st.session_state.url_key = str(uuid.uuid4())
+    st.session_state.parsed_sections = None
 
 # Display existing chat messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+
+# Add tabs for different input methods
+tab1, tab2 = st.tabs(["ClinicalTrials.gov URL", "PDF Upload"])
+
+with tab1:
+    st.markdown("### Enter ClinicalTrials.gov URL")
+
+with tab2:
+    st.markdown("### Upload PDF Document")
+    handle_pdf_upload()
 
 # Show persistent download options in main chat area if a summary exists
 if hasattr(st.session_state, 'current_summary') and st.session_state.current_summary:
@@ -960,10 +1071,13 @@ if hasattr(st.session_state, 'current_summary') and st.session_state.current_sum
     
     st.markdown("---")
 
-# Handle the initial URL input
-url_input = st.text_input("ClinicalTrials.gov URL:", placeholder="e.g., https://clinicaltrials.gov/study/NCT01234567", key=st.session_state.url_key)
+# Handle the initial URL input - inside tab1
+url_input = ""
+nct_match = None
 
-nct_match = re.search(r"NCT\d{8}", url_input)
+with tab1:
+    url_input = st.text_input("ClinicalTrials.gov URL:", placeholder="e.g., https://clinicaltrials.gov/study/NCT01234567", key=st.session_state.url_key)
+    nct_match = re.search(r"NCT\d{8}", url_input)
 
 if url_input and nct_match and not st.session_state.messages:
     nct_number = nct_match.group(0)
@@ -1011,6 +1125,7 @@ if url_input and nct_match and not st.session_state.messages:
 - Phase: [Extract phase information]
 - Design: [Extract design information]
 - Brief Description: [Extract brief description - 2-3 sentences max]
+
 
 ### Primary Objectives
 [List main safety and/or efficacy endpoints - bullet points, be specific]

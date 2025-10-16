@@ -281,6 +281,71 @@ class ClinicalTrialPDFParser:
         except Exception as e:
             logger.error(f"Error extracting tables: {e}")
         return tables
+    
+    def parse_pdf_bytes(self, pdf_bytes: bytes) -> Dict[str, str]:
+        """
+        Parse PDF from bytes and return content organized by sections.
+        
+        Args:
+            pdf_bytes: PDF file as bytes
+            
+        Returns:
+            Dictionary with section headers as keys and content as values
+        """
+        logger.info("Parsing PDF from bytes")
+        
+        text = self.extract_text_from_bytes(pdf_bytes)
+        
+        if not text:
+            raise ValueError("Could not extract text from PDF bytes")
+        
+        return self.parse_by_sections(text)
+    
+    def get_section_summary(self, sections: Dict[str, str]) -> Dict[str, int]:
+        """
+        Get a summary of sections with word counts.
+        
+        Args:
+            sections: Dictionary of sections
+            
+        Returns:
+            Dictionary with section names and word counts
+        """
+        summary = {}
+        for section_name, content in sections.items():
+            word_count = len(content.split())
+            summary[section_name] = word_count
+        
+        return summary
+    
+    def search_sections(self, sections: Dict[str, str], search_term: str, case_sensitive: bool = False) -> Dict[str, List[str]]:
+        """
+        Search for a term across all sections.
+        
+        Args:
+            sections: Dictionary of sections
+            search_term: Term to search for
+            case_sensitive: Whether search should be case sensitive
+            
+        Returns:
+            Dictionary with section names and matching sentences
+        """
+        results = {}
+        flags = 0 if case_sensitive else re.IGNORECASE
+        
+        for section_name, content in sections.items():
+            sentences = re.split(r'[.!?]+', content)
+            matching_sentences = []
+            
+            for sentence in sentences:
+                if re.search(re.escape(search_term), sentence, flags):
+                    matching_sentences.append(sentence.strip())
+            
+            if matching_sentences:
+                results[section_name] = matching_sentences
+        
+        return results
+
 def map_sections_to_schema(sections: dict, tables: list = None) -> dict:
     """
     Enhanced mapping of parsed PDF sections to the required clinical trial JSON schema using robust heuristics, synonyms, and fallback strategies.
@@ -347,71 +412,6 @@ def parse_all_pdfs_in_folder(folder_path: str, as_schema: bool = False) -> dict:
         except Exception as e:
             logger.error(f"Failed to parse {pdf_file}: {e}")
     return results
-    
-    def parse_pdf_bytes(self, pdf_bytes: bytes) -> Dict[str, str]:
-        """
-        Parse PDF from bytes and return content organized by sections.
-        
-        Args:
-            pdf_bytes: PDF file as bytes
-            
-        Returns:
-            Dictionary with section headers as keys and content as values
-        """
-        logger.info("Parsing PDF from bytes")
-        
-        text = self.extract_text_from_bytes(pdf_bytes)
-        
-        if not text:
-            raise ValueError("Could not extract text from PDF bytes")
-        
-        return self.parse_by_sections(text)
-    
-    def get_section_summary(self, sections: Dict[str, str]) -> Dict[str, int]:
-        """
-        Get a summary of sections with word counts.
-        
-        Args:
-            sections: Dictionary of sections
-            
-        Returns:
-            Dictionary with section names and word counts
-        """
-        summary = {}
-        for section_name, content in sections.items():
-            word_count = len(content.split())
-            summary[section_name] = word_count
-        
-        return summary
-    
-    def search_sections(self, sections: Dict[str, str], search_term: str, case_sensitive: bool = False) -> Dict[str, List[str]]:
-        """
-        Search for a term across all sections.
-        
-        Args:
-            sections: Dictionary of sections
-            search_term: Term to search for
-            case_sensitive: Whether search should be case sensitive
-            
-        Returns:
-            Dictionary with section names and matching sentences
-        """
-        results = {}
-        flags = 0 if case_sensitive else re.IGNORECASE
-        
-        for section_name, content in sections.items():
-            sentences = re.split(r'[.!?]+', content)
-            matching_sentences = []
-            
-            for sentence in sentences:
-                if re.search(re.escape(search_term), sentence, flags):
-                    matching_sentences.append(sentence.strip())
-            
-            if matching_sentences:
-                results[section_name] = matching_sentences
-        
-        return results
-
 
 def main():
     """

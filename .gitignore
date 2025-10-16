@@ -27,3 +27,22 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Output files
+test_output_*.json
+enhanced_output_*.json
+parsed_clinical_trials.json
+
+# Test and debug files
+debug_test.py
+quick_test.py
+test_advance.py
+TEST_*.md
+TEST_*.py
+
+# Large PDF test files (add manually if needed)
+*.pdf
+
+# Cleanup documentation (temporary)
+GIT_READY.md
+PROJECT_STRUCTURE.md
