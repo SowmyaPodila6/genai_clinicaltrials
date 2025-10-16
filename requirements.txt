@@ -2,3 +2,7 @@ streamlit
 openai
 requests
 fpdf
+PyPDF2
+pdfplumber
+python-docx
+re

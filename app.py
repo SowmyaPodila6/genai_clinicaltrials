@@ -7,6 +7,7 @@ import os
 import sqlite3
 import uuid
 from fpdf import FPDF
+from clinical_trail_parser import ClinicalTrialPDFParser
 
 # Set up the OpenAI API key from Streamlit secrets
 openai.api_key = st.secrets["OPENAI_API_KEY"]
@@ -150,7 +151,117 @@ def new_chat_click():
     st.rerun()
 
 st.title("Gen AI-Powered Clinical Protocol Summarizer v4")
-st.markdown("Enter a ClinicalTrials.gov URL below to get a formatted summary of the study.")
+st.markdown("Enter a ClinicalTrials.gov URL or upload a PDF document to get a formatted summary of the study.")
+
+# Sidebar with new chat button
+with st.sidebar:
+    st.markdown("### Chat Controls")
+    if st.button("🔄 New Chat", type="primary"):
+        new_chat_click()
+    
+    st.markdown("---")
+    st.markdown("### Instructions")
+    st.markdown("1. **URL Tab**: Enter a ClinicalTrials.gov URL to fetch and summarize study data")
+    st.markdown("2. **PDF Tab**: Upload a clinical trial PDF document to parse and analyze")
+    st.markdown("3. Ask follow-up questions about the study or document")
+
+def handle_url_input():
+    """Handle the URL input functionality."""
+    # Handle the initial URL input
+    url_input = st.text_input("ClinicalTrials.gov URL:", placeholder="e.g., https://clinicaltrials.gov/study/NCT01234567", key=st.session_state.url_key)
+
+    nct_match = re.search(r"NCT\d{8}", url_input)
+
+    if url_input and nct_match and not st.session_state.messages:
+        nct_number = nct_match.group(0)
+        st.info(f"Found NCT number: **{nct_number}**. Fetching full protocol JSON...")
+        
+        json_data, fetch_error = get_protocol_data(nct_number)
+
+        if fetch_error:
+            st.error(fetch_error)
+        elif json_data:
+            st.session_state.messages.append({"role": "user", "content": f"URL: {url_input}"})
+            with st.chat_message("user"):
+                st.markdown(f"URL: {url_input}")
+            save_message_to_db(st.session_state.current_convo_id, "user", f"URL: {url_input}")
+                
+            st.success("Protocol JSON fetched successfully! Generating summary...")
+            
+            with st.spinner("Summarizing protocol with GPT-4o..."):
+                initial_prompt = create_mock_summary_prompt(json_data)
+                
+                messages_for_api = [
+                    {"role": "system", "content": "You are a medical summarization assistant. Provide a concise and clear summary of the provided JSON data, formatted exactly like the example provided in the prompt. Do not invent information. If a section's information is not present, state that it is not available."},
+                    {"role": "user", "content": initial_prompt}
+                ]
+                
+                summary, summary_error = summarize_with_gpt4o(messages_for_api)
+
+            if summary_error:
+                st.error(summary_error)
+            else:
+                st.session_state.messages.append({"role": "assistant", "content": summary})
+                with st.chat_message("assistant"):
+                    st.markdown(summary)
+                
+                save_message_to_db(st.session_state.current_convo_id, "assistant", summary)
+
+def handle_pdf_upload():
+    """Handle the PDF upload and parsing functionality."""
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+    
+    if uploaded_file is not None:
+        st.info(f"Uploaded: **{uploaded_file.name}** ({uploaded_file.size} bytes)")
+        
+        with st.spinner("Parsing PDF document..."):
+            try:
+                # Parse PDF
+                parser = ClinicalTrialPDFParser()
+                pdf_bytes = uploaded_file.read()
+                sections = parser.parse_pdf_bytes(pdf_bytes)
+                
+                # Map to strict 9-field schema
+                from clinical_trail_parser import map_sections_to_schema
+                parsed_schema = map_sections_to_schema(sections)
+                
+                # Store parsed sections in session state for follow-up questions
+                st.session_state.parsed_sections = parsed_schema
+                
+                # Add upload notification to chat
+                st.session_state.messages.append({"role": "user", "content": f"Uploaded PDF: {uploaded_file.name}"})
+                save_message_to_db(st.session_state.current_convo_id, "user", f"Uploaded PDF: {uploaded_file.name}")
+                
+                # Show confirmation message
+                confirmation_msg = f"✅ **PDF uploaded and parsed successfully!**\n\n**Document:** {uploaded_file.name}\n\n**Fields parsed:**\n"
+                for field in parsed_schema.keys():
+                    has_content = bool(parsed_schema[field].strip())
+                    status = "✓" if has_content else "✗"
+                    confirmation_msg += f"- {status} {field}\n"
+                
+                confirmation_msg += "\n**What would you like to do?**\n- Ask specific questions about the document\n- Request a full summary\n- Ask about particular sections"
+                
+                st.session_state.messages.append({"role": "assistant", "content": confirmation_msg})
+                save_message_to_db(st.session_state.current_convo_id, "assistant", confirmation_msg)
+                
+                st.success("PDF parsed successfully! Ask questions or request a summary in the chat below.")
+                
+            except Exception as e:
+                error_msg = f"Error parsing PDF: {str(e)}"
+                st.error(error_msg)
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                save_message_to_db(st.session_state.current_convo_id, "assistant", error_msg)
+
+# Add tabs for different input methods
+tab1, tab2 = st.tabs(["ClinicalTrials.gov URL", "PDF Upload"])
+
+with tab1:
+    st.markdown("### Enter ClinicalTrials.gov URL")
+    handle_url_input()
+
+with tab2:
+    st.markdown("### Upload PDF Document")
+    handle_pdf_upload()
 
 # The "Past Chats" functionality is no longer available to prevent database concurrency issues.
 # Each user session will now have a fresh, isolated conversation.
@@ -162,60 +273,31 @@ if "current_convo_id" not in st.session_state:
     st.session_state.current_convo_id = str(uuid.uuid4())
     st.session_state.url_key = str(uuid.uuid4())
 
+if "parsed_sections" not in st.session_state:
+    st.session_state.parsed_sections = None
+
 # Display existing chat messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Handle the initial URL input
-url_input = st.text_input("ClinicalTrials.gov URL:", placeholder="e.g., https://clinicaltrials.gov/study/NCT01234567", key=st.session_state.url_key)
-
-nct_match = re.search(r"NCT\d{8}", url_input)
-
-if url_input and nct_match and not st.session_state.messages:
-    nct_number = nct_match.group(0)
-    st.info(f"Found NCT number: **{nct_number}**. Fetching full protocol JSON...")
-    
-    json_data, fetch_error = get_protocol_data(nct_number)
-
-    if fetch_error:
-        st.error(fetch_error)
-    elif json_data:
-        st.session_state.messages.append({"role": "user", "content": f"URL: {url_input}"})
-        with st.chat_message("user"):
-            st.markdown(f"URL: {url_input}")
-        save_message_to_db(st.session_state.current_convo_id, "user", f"URL: {url_input}")
-            
-        st.success("Protocol JSON fetched successfully! Generating summary...")
-        
-        with st.spinner("Summarizing protocol with GPT-4o..."):
-            initial_prompt = create_mock_summary_prompt(json_data)
-            
-            messages_for_api = [
-                {"role": "system", "content": "You are a medical summarization assistant. Provide a concise and clear summary of the provided JSON data, formatted exactly like the example provided in the prompt. Do not invent information. If a section's information is not present, state that it is not available."},
-                {"role": "user", "content": initial_prompt}
-            ]
-            
-            summary, summary_error = summarize_with_gpt4o(messages_for_api)
-
-        if summary_error:
-            st.error(summary_error)
-        else:
-            st.session_state.messages.append({"role": "assistant", "content": summary})
-            with st.chat_message("assistant"):
-                st.markdown(summary)
-            
-            save_message_to_db(st.session_state.current_convo_id, "assistant", summary)
-            
 # Handle follow-up chat input
-if prompt := st.chat_input("Ask a follow-up question about the study..."):
+if prompt := st.chat_input("Ask a follow-up question about the study or document..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
     save_message_to_db(st.session_state.current_convo_id, "user", prompt)
 
+    # Prepare context for the API call
+    system_content = "You are a medical summarization assistant. Answer questions based on the provided protocol text or document sections. Do not invent information."
+    
+    # If we have parsed PDF sections, include them in the context
+    if st.session_state.parsed_sections:
+        sections_text = "\n\n".join([f"**{section}:**\n{content}" for section, content in st.session_state.parsed_sections.items()])
+        system_content += f"\n\nDocument sections for reference:\n{sections_text}"
+
     messages_for_api = [
-        {"role": "system", "content": "You are a medical summarization assistant. Answer questions based on the provided protocol text. Do not invent information."},
+        {"role": "system", "content": system_content},
     ]
     messages_for_api.extend(st.session_state.messages)
 
