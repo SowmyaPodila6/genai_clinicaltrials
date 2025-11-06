@@ -81,7 +81,7 @@ def parse_pdf(state: WorkflowState) -> WorkflowState:
             pdf_bytes = response.content
             sections = parser.parse_pdf_bytes(pdf_bytes)
         else:
-            sections = parser.parse_pdf(state["input_url"])
+            sections = parser.parse_pdf_file(state["input_url"])
         
         # Map to schema (9 fields)
         parsed_schema = map_sections_to_schema(sections)
@@ -282,7 +282,7 @@ def llm_fallback(state: WorkflowState) -> WorkflowState:
                 response = requests.get(state["input_url"])
                 sections = parser.parse_pdf_bytes(response.content)
             else:
-                sections = parser.parse_pdf(state["input_url"])
+                sections = parser.parse_pdf_file(state["input_url"])
             full_text = json.dumps(sections, indent=2)
         else:
             full_text = json.dumps(state["raw_data"], indent=2)
