@@ -53,3 +53,5 @@ app_v1_backup.py
 app_langgraph*.py
 test_*.py
 test_*.json
+
+.streamlit/secrets.toml
