@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 # Import local modules
 from clinical_trail_parser import ClinicalTrialPDFParser, map_sections_to_schema
-from langgraph.prompts import (
+from langgraph_custom.prompts import (
     SUMMARIZATION_SYSTEM_PROMPT, 
     SUMMARY_GENERATION_TEMPLATE,
     QA_SYSTEM_PROMPT,

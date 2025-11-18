@@ -16,7 +16,7 @@ current_dir = Path(__file__).parent
 parent_dir = current_dir.parent
 sys.path.insert(0, str(parent_dir))
 
-from langgraph.langgraph_workflow import build_workflow, chat_node_stream
+from langgraph_custom.langgraph_workflow import build_workflow, chat_node_stream
 from dotenv import load_dotenv
 import re
 
@@ -256,19 +256,23 @@ if "current_state" not in st.session_state:
 logo_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "ctis-2024.png")
 if os.path.exists(logo_path):
     st.markdown("""
-        <div style='display: flex; align-items: center; justify-content: center; gap: 20px; margin-bottom: 15px;'>
-            <img src='data:image/png;base64,{}' width='90' style='flex-shrink: 0;'/>
-            <div>
-                <h1 style='margin: 0; padding: 0; color: #C1272D; font-size: 2.2em; white-space: nowrap;'>ClinicalIQ – AI-Powered Protocol Intelligence</h1>
-                <p style='color: #666; margin: 5px 0 0 0; padding: 0; font-size: 1em; text-align: center;'>📄 Enter a ClinicalTrials.gov URL or upload a PDF document to analyze</p>
+        <div style='display: flex; align-items: center; justify-content: center; gap: 25px; margin-bottom: 30px; padding: 30px 0; background: linear-gradient(135deg, #f5f7fa 0%, #ffffff 100%);'>
+            <img src='data:image/png;base64,{}' width='110' style='flex-shrink: 0;'/>
+            <div style='text-align: center;'>
+                <h1 style='margin: 0; padding: 0; font-size: 3.5em; font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: 700; letter-spacing: -1.5px;'>
+                    <span style='color: #C1272D;'>Cli</span><span style='color: #1E293B;'>nicalI</span><span style='color: #C1272D;'>Q</span>
+                </h1>
+                <p style='color: #64748B; margin: 12px 0 0 0; padding: 0; font-size: 1.2em; font-weight: 500; font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;'>AI-Powered Clinical Protocol Intelligence Platform</p>
             </div>
         </div>
     """.format(__import__('base64').b64encode(open(logo_path, 'rb').read()).decode()), unsafe_allow_html=True)
 else:
     st.markdown("""
-        <div style='text-align: center; margin-bottom: 15px;'>
-            <h1 style='margin: 0; padding: 0; color: #C1272D; font-size: 2.2em; white-space: nowrap;'>ClinicalIQ – AI-Powered Protocol Intelligence</h1>
-            <p style='color: #666; margin: 5px 0 0 0; padding: 0; font-size: 1em;'>📄 Enter a ClinicalTrials.gov URL or upload a PDF document to analyze</p>
+        <div style='text-align: center; margin-bottom: 30px; padding: 30px 0; background: linear-gradient(135deg, #f5f7fa 0%, #ffffff 100%);'>
+            <h1 style='margin: 0; padding: 0; font-size: 3.5em; font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: 700; letter-spacing: -1.5px;'>
+                <span style='color: #C1272D;'>Cli</span><span style='color: #1E293B;'>nicalI</span><span style='color: #C1272D;'>Q</span>
+            </h1>
+            <p style='color: #64748B; margin: 12px 0 0 0; padding: 0; font-size: 1.2em; font-weight: 500; font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;'>AI-Powered Clinical Protocol Intelligence Platform</p>
         </div>
     """, unsafe_allow_html=True)
 
@@ -382,15 +386,15 @@ if st.session_state.current_state:
 if not st.session_state.messages:
     with st.chat_message("assistant"):
         st.markdown("""
-👋 **Welcome to the Clinical Trial Analysis Assistant!**
+👋 **Welcome to ClinicalIQ – AI-Powered Clinical Protocol Intelligence Platform!**
 
-I can help you analyze clinical trial documents. You can:
+I leverage advanced AI to help you summarize and analyze clinical trial protocols. You can:
 
 - 📋 **Paste a ClinicalTrials.gov URL** (e.g., `https://clinicaltrials.gov/study/NCT03991871`)
-- 📄 **Upload a PDF document** using the 📎 button below
-- 💬 **Ask questions** about the extracted data
+- 📄 **Upload a PDF protocol document** using the 📎 button below
+- 💬 **Ask intelligent questions** about the extracted data and get instant insights
 
-Just paste a URL or upload a file to get started!
+Let's transform your clinical protocol analysis – paste a URL or upload a file to begin!
         """)
 
 # Display existing chat messages
@@ -398,29 +402,19 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Input widgets - URL/File upload (only show on initial state)
-url_input = None
-nct_match = None
-uploaded_file = None
-
+# File uploader - clean minimal design
 if not st.session_state.messages:
-    # URL input
-    url_input = st.text_input(
-        "🔗 Enter ClinicalTrials.gov URL:",
-        placeholder="https://clinicaltrials.gov/study/NCT03991871",
-        key=st.session_state.get("url_key", "url_input")
-    )
-    
-    # File uploader
     uploaded_file = st.file_uploader(
-        "📎 Or upload a PDF document:",
+        "📎 Upload PDF",
         type=["pdf"],
         key="pdf_uploader"
     )
-    
-    # Check for NCT number in URL
-    if url_input:
-        nct_match = re.search(r'NCT\d{8}', url_input)
+else:
+    uploaded_file = None
+
+# Initialize variables
+url_input = None
+nct_match = None
 
 # Handle initial URL input
 if url_input and nct_match and not st.session_state.messages:
@@ -845,47 +839,116 @@ if uploaded_file is not None and not st.session_state.messages:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-# Handle follow-up chat input (with streaming)
-if prompt := st.chat_input("Ask a follow-up question about the study..."):
-    # Add user message
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    save_message_to_db(st.session_state.current_convo_id, "user", prompt)
+# Handle chat input (URLs, questions, with file upload support)
+if prompt := st.chat_input("Ask a question or paste a ClinicalTrials.gov URL..."):
+    # Check if it's a URL
+    nct_match = re.search(r'NCT\d{8}', prompt)
+    is_url = nct_match is not None or 'clinicaltrials.gov' in prompt.lower()
     
-    # Generate response with streaming
-    with st.chat_message("assistant"):
-        if st.session_state.current_state:
-            # Update state with new query
-            chat_state = st.session_state.current_state.copy()
-            chat_state["chat_query"] = prompt
-            
-            message_placeholder = st.empty()
-            full_response = ""
-            
+    if is_url and not st.session_state.messages:
+        # Handle URL input
+        url_input = prompt
+        nct_number = nct_match.group(0) if nct_match else "Unknown"
+        
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": f"URL: {url_input}"})
+        with st.chat_message("user"):
+            st.markdown(f"URL: {url_input}")
+        save_message_to_db(st.session_state.current_convo_id, "user", f"URL: {url_input}")
+        
+        # Run workflow
+        with st.spinner("Extracting data from ClinicalTrials.gov..."):
             try:
-                # Stream response
-                for chunk in chat_node_stream(chat_state):
-                    full_response += chunk
-                    message_placeholder.markdown(full_response + "▌")
+                initial_state = {
+                    "input_url": url_input,
+                    "input_type": "unknown",
+                    "raw_data": {},
+                    "parsed_json": {},
+                    "data_to_summarize": {},
+                    "confidence_score": 0.0,
+                    "completeness_score": 0.0,
+                    "missing_fields": [],
+                    "nct_id": "",
+                    "chat_query": "generate_summary",
+                    "chat_response": "",
+                    "stream_response": None,
+                    "error": "",
+                    "used_llm_fallback": False
+                }
                 
-                message_placeholder.markdown(full_response)
+                # Process through workflow
+                result = st.session_state.workflow_app.invoke(initial_state)
                 
-                # Save to session and database
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
-                save_message_to_db(st.session_state.current_convo_id, "assistant", full_response)
-                
+                if result.get("error"):
+                    st.error(f"Error: {result['error']}")
+                    st.session_state.messages.append({"role": "assistant", "content": f"Error: {result['error']}"})
+                    save_message_to_db(st.session_state.current_convo_id, "assistant", f"Error: {result['error']}")
+                else:
+                    st.session_state.current_state = result
+                    
+                    # Show metrics
+                    metrics_msg = create_metrics_message(result)
+                    with st.chat_message("assistant"):
+                        st.markdown(metrics_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": metrics_msg})
+                    save_message_to_db(st.session_state.current_convo_id, "assistant", metrics_msg)
+                    
+                    # Stream summary
+                    with st.chat_message("assistant"):
+                        message_placeholder = st.empty()
+                        full_response = ""
+                        
+                        for chunk in chat_node_stream(result):
+                            full_response += chunk
+                            message_placeholder.markdown(full_response + "▌")
+                        
+                        message_placeholder.markdown(full_response)
+                    
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                    save_message_to_db(st.session_state.current_convo_id, "assistant", full_response)
+                    st.rerun()
+                    
             except Exception as e:
-                error_msg = f"Error: {str(e)}"
+                error_msg = f"An error occurred: {str(e)}"
                 st.error(error_msg)
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
                 save_message_to_db(st.session_state.current_convo_id, "assistant", error_msg)
-        else:
-            no_data_msg = "Please process a document first before asking questions."
-            st.warning(no_data_msg)
-            st.session_state.messages.append({"role": "assistant", "content": no_data_msg})
-            save_message_to_db(st.session_state.current_convo_id, "assistant", no_data_msg)
-
-# Footer
-st.divider()
-st.caption("🔬 Clinical Trial Analysis System | LangGraph Workflow | Enhanced Parser | Powered by OpenAI GPT-4")
+    else:
+        # Handle regular chat questions
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        save_message_to_db(st.session_state.current_convo_id, "user", prompt)
+        
+        # Generate response with streaming
+        with st.chat_message("assistant"):
+            if st.session_state.current_state:
+                # Update state with new query
+                chat_state = st.session_state.current_state.copy()
+                chat_state["chat_query"] = prompt
+                
+                message_placeholder = st.empty()
+                full_response = ""
+                
+                try:
+                    # Stream response
+                    for chunk in chat_node_stream(chat_state):
+                        full_response += chunk
+                        message_placeholder.markdown(full_response + "▌")
+                    
+                    message_placeholder.markdown(full_response)
+                    
+                    # Save to session and database
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                    save_message_to_db(st.session_state.current_convo_id, "assistant", full_response)
+                    
+                except Exception as e:
+                    error_msg = f"Error: {str(e)}"
+                    st.error(error_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                    save_message_to_db(st.session_state.current_convo_id, "assistant", error_msg)
+            else:
+                no_data_msg = "Please process a document first before asking questions."
+                st.warning(no_data_msg)
+                st.session_state.messages.append({"role": "assistant", "content": no_data_msg})
+                save_message_to_db(st.session_state.current_convo_id, "assistant", no_data_msg)

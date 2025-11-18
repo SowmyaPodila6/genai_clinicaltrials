@@ -4,7 +4,7 @@ Following official LangGraph documentation patterns
 Integrated with app_v1.py functionality
 """
 
-from typing import TypedDict, Annotated, Literal, Iterator
+from typing import TypedDict, Annotated, Literal, Iterator, Optional, Callable
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessageChunk
@@ -14,15 +14,25 @@ import requests
 from pathlib import Path
 from dotenv import load_dotenv
 import os
+import time
 
 # Import parsers - use EnhancedClinicalTrialParser for better accuracy
-from langgraph.enhanced_parser import EnhancedClinicalTrialParser, ClinicalTrialData
-from clinical_trail_parser import map_sections_to_schema
+from langgraph_custom.enhanced_parser import EnhancedClinicalTrialParser, ClinicalTrialData
+
+# Import multi-turn extractor for handling large PDFs without rate limiting
+try:
+    from .multi_turn_extractor import MultiTurnExtractor, estimate_extraction_cost
+    MULTI_TURN_AVAILABLE = True
+except ImportError:
+    MULTI_TURN_AVAILABLE = False
+    print("⚠️  multi_turn_extractor not available - falling back to single-call extraction")
 
 load_dotenv()
 
 # Initialize LLM with streaming support
-llm = ChatOpenAI(model="gpt-4o", temperature=0.1, streaming=True)
+# Using gpt-4o-mini for higher rate limits (200k TPM vs 30k TPM for gpt-4o)
+# gpt-4o-mini is 15x cheaper and has 128k context window (same as gpt-4o)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1, streaming=True)
 
 # System message for GPT-4 summarization (from app_v1)
 SYSTEM_MESSAGE = "You are a clinical research summarization expert. Create concise, well-formatted summaries that focus only on available information. Avoid filler text and sections with insufficient data. Use clear markdown formatting and keep summaries under 400 words while including all key available information."
@@ -32,7 +42,8 @@ class WorkflowState(TypedDict):
     input_url: str
     input_type: Literal["pdf", "url", "unknown"]
     raw_data: dict  # Raw API response or PDF data
-    parsed_json: dict  # Structured 9-field schema
+    parsed_json: dict  # Structured 9-field schema (final, after LLM if used)
+    parser_only_json: dict  # Parser output before LLM enhancement
     data_to_summarize: dict  # Formatted for GPT (like app_v1)
     confidence_score: float
     completeness_score: float
@@ -43,6 +54,10 @@ class WorkflowState(TypedDict):
     stream_response: Iterator  # For streaming
     error: str
     used_llm_fallback: bool  # Track if LLM fallback was used
+    # Multi-turn extraction progress tracking
+    extraction_progress: dict  # {"current_field": str, "completed": int, "total": int}
+    extraction_cost_estimate: dict  # Cost and time estimates
+    progress_log: list  # Real-time progress messages for UI display
 
 
 def classify_input(state: WorkflowState) -> WorkflowState:
@@ -851,8 +866,8 @@ def calculate_metrics(parsed_json: dict) -> tuple[float, float, list]:
 
 
 def check_quality(state: WorkflowState) -> Literal["llm_fallback", "chat_node"]:
-    """Conditional edge: Check if LLM fallback is needed"""
-    if state["confidence_score"] < 0.5 or state["completeness_score"] < 0.6:
+    """Conditional edge: Check if LLM fallback is needed - triggers if completeness < 90%"""
+    if state["confidence_score"] < 0.9 or state["completeness_score"] < 0.9:
         return "llm_fallback"
     else:
         return "chat_node"
@@ -945,10 +960,24 @@ Return as JSON. If a field is not found in this chunk, return null for that fiel
 
 
 def llm_fallback(state: WorkflowState) -> WorkflowState:
-    """Node: Use LLM to extract complete structured data from full PDF with citations and exact content"""
+    """Node: Use multi-turn LLM extraction to handle large PDFs without rate limiting"""
+    
+    # Helper function to log progress
+    def log_progress(message: str):
+        """Add progress message to state and print to console"""
+        if "progress_log" not in state:
+            state["progress_log"] = []
+        state["progress_log"].append(message)
+        print(message)
+    
     try:
         # Mark that LLM fallback is being used
         state["used_llm_fallback"] = True
+        
+        # Save parser-only output before LLM enhancement
+        import copy
+        state["parser_only_json"] = copy.deepcopy(state.get("parsed_json", {}))
+        log_progress("📋 Saved parser-only output for comparison")
         
         # Get full document text
         if state["input_type"] == "pdf":
@@ -975,139 +1004,177 @@ def llm_fallback(state: WorkflowState) -> WorkflowState:
             # For URLs, use the raw API data
             full_text = json.dumps(state["raw_data"], indent=2)
         
-        # SEND FULL PDF TO GPT-4o - No truncation to ensure complete extraction
-        # GPT-4o can handle very large contexts (128k tokens)
-        print(f"📄 Sending full document to GPT-4o: {len(full_text):,} characters ({len(full_text.split()):,} words)")
+        log_progress(f"📄 Document size: {len(full_text):,} characters ({len(full_text.split()):,} words)")
         
-        # Enhanced LLM extraction prompt with citation requirements
-        system_prompt = """You are a clinical trial data extraction expert with deep knowledge of clinical trial protocols.
+        # Estimate cost and time for multi-turn extraction
+        if MULTI_TURN_AVAILABLE:
+            cost_estimate = estimate_extraction_cost(full_text, model="gpt-4o-mini")
+            state["extraction_cost_estimate"] = cost_estimate
+            
+            log_progress(f"💰 Estimated cost: ${cost_estimate['total_cost']:.3f}")
+            log_progress(f"⏱️  Estimated time: {cost_estimate['estimated_time_minutes']:.1f} minutes")
+            log_progress(f"🔢 Total tokens: {cost_estimate['total_tokens']:,}")
+            
+            # Use multi-turn extraction to avoid rate limits
+            log_progress(f"🔄 Using multi-turn extraction (9 fields, one at a time)")
+            
+            extractor = MultiTurnExtractor(
+                model="gpt-4o-mini",
+                temperature=0.1,
+                max_tokens_per_call=180000,  # Leave buffer under 200k limit
+                delay_between_calls=2.0  # 2 seconds between calls
+            )
+            
+            # Progress callback for state updates
+            def progress_callback(field_name: str, current: int, total: int):
+                state["extraction_progress"] = {
+                    "current_field": field_name,
+                    "completed": current - 1,
+                    "total": total
+                }
+                log_progress(f"  [{current}/{total}] Extracting: {field_name}")
+            
+            # Extract all fields using multi-turn strategy
+            extracted_data = extractor.extract_with_retry(
+                full_text,
+                progress_callback=progress_callback,
+                max_retries=2
+            )
+            
+            log_progress(f"✅ Multi-turn extraction complete: {len(extracted_data)} fields")
+            
+        else:
+            # Fallback to single-call extraction if multi-turn not available
+            log_progress(f"⚠️  Multi-turn extractor not available, using single-call fallback")
+            log_progress(f"⚠️  This may hit rate limits for large documents!")
+            
+            extracted_data = _single_call_extraction(full_text)
+        
+        # Debug: Show what was extracted
+        total_words = 0
+        for field, value in extracted_data.items():
+            if value and value != "null" and value:
+                word_count = len(str(value).split()) if value else 0
+                total_words += word_count
+                log_progress(f"   ✓ {field}: {word_count:,} words")
+            else:
+                log_progress(f"   ✗ {field}: EMPTY")
+        
+        log_progress(f"📊 Total extracted: {total_words:,} words")
+        
+        # Update state with LLM extracted data (replace all fields)
+        for field, value in extracted_data.items():
+            if value and value != "null" and value:
+                state["parsed_json"][field] = value
+        
+        # Also update data_to_summarize for display
+        field_mapping = {
+            "study_overview": "Study Overview",
+            "brief_description": "Brief Description",
+            "primary_secondary_objectives": "Primary and Secondary Objectives",
+            "treatment_arms_interventions": "Treatment Arms and Interventions",
+            "eligibility_criteria": "Eligibility Criteria",
+            "enrollment_participant_flow": "Enrollment and Participant Flow",
+            "adverse_events_profile": "Adverse Events Profile",
+            "study_locations": "Study Locations",
+            "sponsor_information": "Sponsor Information"
+        }
+        
+        for field, value in extracted_data.items():
+            if value and value != "null" and value:
+                display_key = field_mapping.get(field, field)
+                state["data_to_summarize"][display_key] = value
+        
+        log_progress(f"✅ State updated with extracted data")
+        
+        # Recalculate metrics
+        state["confidence_score"], state["completeness_score"], state["missing_fields"] = calculate_metrics(state["parsed_json"])
+        log_progress(f"📊 Final metrics - Confidence: {state['confidence_score']:.1%}, Completeness: {state['completeness_score']:.1%}")
+        
+    except Exception as e:
+        log_progress(f"❌ Multi-turn extraction error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        state["error"] = f"LLM fallback error: {str(e)}"
+    
+    return state
 
-Your task is to extract structured information from the clinical trial document and create a comprehensive JSON output.
+
+def _single_call_extraction(full_text: str) -> dict:
+    """
+    Fallback single-call extraction (may hit rate limits for large documents).
+    Used only if MultiTurnExtractor is not available.
+    """
+    # Enhanced LLM extraction prompt
+    system_prompt = """You are a clinical trial data extraction expert.
+
+Extract structured information from the clinical trial document and create a comprehensive JSON output.
 
 **CRITICAL REQUIREMENTS:**
-1. Extract EXACT text from the original document - do NOT paraphrase or summarize
-2. Include page references, section numbers, or table numbers where information was found
-3. Preserve all technical terminology, drug names, dosages, and measurements exactly as written
+1. Extract EXACT text from the original document - do NOT paraphrase
+2. Include ALL relevant details from the text
+3. Preserve technical terminology, drug names, dosages, measurements exactly as written
 4. If information spans multiple sections, include all relevant content
-5. For tables and structured data, preserve the original format and values
-6. Include protocol version, date, and document identifiers when available
 
 **Required Fields to Extract:**
 
-1. **study_overview**: Extract title, NCT ID, protocol number, version, date, phase, study type, disease/indication
-   
-2. **brief_description**: Extract the study's brief summary or background section (first 500-1000 words)
-
-3. **primary_secondary_objectives**: Extract primary and secondary endpoints with exact outcome measures, time frames, and definitions. Include both efficacy and safety objectives.
-
-4. **treatment_arms_interventions**: Extract all treatment arms, drug names, doses, schedules, administration routes, and combination therapies. Include dosing tables if present.
-
-5. **eligibility_criteria**: Extract complete inclusion and exclusion criteria lists with specific values (age ranges, lab values, prior treatments, etc.)
-
-6. **enrollment_participant_flow**: Extract target enrollment, actual enrollment, patient disposition, screening numbers, and completion rates
-
-7. **adverse_events_profile**: Extract adverse event tables, serious adverse events, Grade 3+ events, and safety monitoring procedures
-
-8. **study_locations**: Extract site names, cities, countries, principal investigators, and contact information
-
-9. **sponsor_information**: Extract sponsor name, medical monitor, CRO information, and collaborators
+1. **study_overview**: Title, NCT ID, protocol number, phase, study type, disease
+2. **brief_description**: Study's brief summary or background (first 500-1000 words)
+3. **primary_secondary_objectives**: Primary and secondary endpoints with exact outcome measures
+4. **treatment_arms_interventions**: All treatment arms, drug names, doses, schedules
+5. **eligibility_criteria**: Complete inclusion and exclusion criteria
+6. **enrollment_participant_flow**: Target enrollment, actual enrollment, patient disposition
+7. **adverse_events_profile**: Adverse event tables, serious adverse events, Grade 3+ events
+8. **study_locations**: Site names, cities, countries, principal investigators
+9. **sponsor_information**: Sponsor name, medical monitor, CRO information
 
 **Output Format:**
-Return a valid JSON object with the structure:
+Return a valid JSON object:
 {
-  "study_overview": "EXACT TEXT with [Page X, Section Y] citations",
-  "brief_description": "EXACT TEXT with citations",
-  "primary_secondary_objectives": "EXACT TEXT with citations",
-  "treatment_arms_interventions": "EXACT TEXT with citations",
-  "eligibility_criteria": "EXACT TEXT with citations",
-  "enrollment_participant_flow": "EXACT TEXT with citations",
-  "adverse_events_profile": "EXACT TEXT with citations",
-  "study_locations": "EXACT TEXT with citations",
-  "sponsor_information": "EXACT TEXT with citations"
+  "study_overview": "EXACT TEXT",
+  "brief_description": "EXACT TEXT",
+  "primary_secondary_objectives": "EXACT TEXT",
+  "treatment_arms_interventions": "EXACT TEXT",
+  "eligibility_criteria": "EXACT TEXT",
+  "enrollment_participant_flow": "EXACT TEXT",
+  "adverse_events_profile": "EXACT TEXT",
+  "study_locations": "EXACT TEXT",
+  "sponsor_information": "EXACT TEXT"
 }
 
-If a field cannot be found in the document, use null instead of an empty string.
-IMPORTANT: Return ONLY the JSON object, no additional text or explanations."""
+If a field cannot be found, use "" (empty string).
+Return ONLY the JSON object, no additional text."""
 
-        # Prepare the full document for LLM
-        user_prompt = f"""Clinical Trial Document (Full Text):
+    user_prompt = f"""Clinical Trial Document:
 
 {full_text}
 
 ---
 
-Please extract all required fields following the instructions. Include exact text with citations."""
+Extract all required fields following the instructions."""
 
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt)
-        ]
-        
-        # Invoke LLM with full document
-        print(f"🤖 Calling GPT-4o for extraction...")
-        response = llm.invoke(messages)
-        print(f"✅ GPT-4o response received: {len(response.content)} characters")
-        
-        # Parse LLM response
-        try:
-            # Try to extract JSON from response
-            response_content = response.content.strip()
-            
-            # Remove markdown code blocks if present
-            if response_content.startswith('```json'):
-                response_content = response_content[7:]
-            if response_content.startswith('```'):
-                response_content = response_content[3:]
-            if response_content.endswith('```'):
-                response_content = response_content[:-3]
-            
-            extracted_data = json.loads(response_content.strip())
-            print(f"✅ JSON parsed successfully: {len(extracted_data)} fields extracted")
-            
-            # Debug: Show what was extracted
-            for field, value in extracted_data.items():
-                if value and value != "null" and value:
-                    word_count = len(str(value).split()) if value else 0
-                    print(f"   - {field}: {word_count} words")
-            
-            # Update state with LLM extracted data (replace all fields)
-            for field, value in extracted_data.items():
-                if value and value != "null":
-                    state["parsed_json"][field] = value
-            
-            # Also update data_to_summarize for display
-            field_mapping = {
-                "study_overview": "Study Overview",
-                "brief_description": "Brief Description",
-                "primary_secondary_objectives": "Primary and Secondary Objectives",
-                "treatment_arms_interventions": "Treatment Arms and Interventions",
-                "eligibility_criteria": "Eligibility Criteria",
-                "enrollment_participant_flow": "Enrollment and Participant Flow",
-                "adverse_events_profile": "Adverse Events Profile",
-                "study_locations": "Study Locations",
-                "sponsor_information": "Sponsor Information"
-            }
-            
-            for field, value in extracted_data.items():
-                if value and value != "null":
-                    display_key = field_mapping.get(field, field)
-                    state["data_to_summarize"][display_key] = value
-            
-            print(f"✅ State updated with LLM extracted data")
-            
-        except json.JSONDecodeError as e:
-            # If JSON parsing fails, log error but don't crash
-            print(f"❌ JSON parsing error: {str(e)}")
-            print(f"Response preview: {response.content[:500]}")
-            state["error"] = f"LLM fallback JSON parsing error: {str(e)}. Response preview: {response.content[:200]}"
-        
-        # Recalculate metrics
-        state["confidence_score"], state["completeness_score"], state["missing_fields"] = calculate_metrics(state["parsed_json"])
-        
-    except Exception as e:
-        state["error"] = f"LLM fallback error: {str(e)}"
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt)
+    ]
     
-    return state
+    # Invoke LLM with full document
+    response = llm.invoke(messages)
+    
+    # Parse LLM response
+    response_content = response.content.strip()
+    
+    # Remove markdown code blocks if present
+    if response_content.startswith('```json'):
+        response_content = response_content[7:]
+    if response_content.startswith('```'):
+        response_content = response_content[3:]
+    if response_content.endswith('```'):
+        response_content = response_content[:-3]
+    
+    extracted_data = json.loads(response_content.strip())
+    
+    return extracted_data
 
 
 def chat_node(state: WorkflowState) -> WorkflowState:

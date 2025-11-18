@@ -2,6 +2,7 @@
 streamlit>=1.28.0
 openai>=1.0.0
 python-dotenv>=1.0.0
+tiktoken>=0.5.0
 
 # LangGraph and LangChain
 langgraph>=0.2.0
@@ -14,6 +15,14 @@ PyMuPDF>=1.23.0
 pdfplumber>=0.10.0
 pdfminer.six>=20221105
 Pillow>=10.0.0
+PyPDF2>=3.0.0
+
+# OCR Support
+pytesseract>=0.3.10
+
+# NLP Support
+spacy>=3.7.0
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0-py3-none-any.whl
 
 # Data Processing
 pandas>=2.0.0
