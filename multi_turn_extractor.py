@@ -117,6 +117,73 @@ class MultiTurnExtractor:
         """Count tokens in text."""
         return len(self.encoding.encode(text))
     
+    def analyze_document_chunking(self, full_text: str) -> Dict[str, Any]:
+        """
+        Analyze how the document would be chunked for each field.
+        Returns statistics without actually performing extraction.
+        
+        Returns:
+            Dictionary with chunking analysis for each field
+        """
+        analysis = {
+            "total_document_chars": len(full_text),
+            "total_document_tokens": self.count_tokens(full_text),
+            "fields": {}
+        }
+        
+        for field_name, config in self.FIELD_CONFIGS.items():
+            relevant_sections = self.find_relevant_sections(full_text, field_name, config)
+            
+            # Calculate how many sections would fit
+            sections_that_fit = 0
+            total_tokens_used = 0
+            max_tokens = config["max_tokens"]
+            
+            for start, end, score in relevant_sections:
+                section_text = full_text[start:end]
+                section_tokens = self.count_tokens(section_text)
+                
+                if total_tokens_used + section_tokens <= max_tokens:
+                    sections_that_fit += 1
+                    total_tokens_used += section_tokens
+                else:
+                    break
+            
+            analysis["fields"][field_name] = {
+                "keywords": config["keywords"],
+                "max_tokens_allowed": max_tokens,
+                "sections_found": len(relevant_sections),
+                "sections_that_fit": sections_that_fit,
+                "tokens_used": total_tokens_used,
+                "utilization_pct": (total_tokens_used / max_tokens) * 100 if max_tokens > 0 else 0,
+                "top_relevance_scores": [s[2] for s in relevant_sections[:5]] if relevant_sections else []
+            }
+        
+        return analysis
+    
+    def print_chunking_analysis(self, full_text: str):
+        """Print a readable analysis of document chunking."""
+        analysis = self.analyze_document_chunking(full_text)
+        
+        print("\n" + "="*80)
+        print("📊 DOCUMENT CHUNKING ANALYSIS")
+        print("="*80)
+        print(f"📄 Total Document: {analysis['total_document_chars']:,} chars, {analysis['total_document_tokens']:,} tokens")
+        print()
+        
+        for field_name, stats in analysis["fields"].items():
+            print(f"\n🔹 {field_name.upper().replace('_', ' ')}")
+            print(f"   Keywords: {', '.join(stats['keywords'])}")
+            print(f"   Max tokens allowed: {stats['max_tokens_allowed']:,}")
+            print(f"   Sections found: {stats['sections_found']}")
+            print(f"   Sections that fit: {stats['sections_that_fit']}")
+            print(f"   Tokens used: {stats['tokens_used']:,} ({stats['utilization_pct']:.1f}% utilization)")
+            if stats['top_relevance_scores']:
+                print(f"   Top relevance scores: {stats['top_relevance_scores']}")
+        
+        print("\n" + "="*80 + "\n")
+
+    
     def find_relevant_sections(
         self,
         full_text: str,
@@ -136,24 +203,39 @@ class MultiTurnExtractor:
         paragraphs = full_text.split('\n\n')
         current_pos = 0
         
+        logger.info(f"🔍 Searching for '{field_name}' using keywords: {keywords}")
+        logger.info(f"📄 Total paragraphs to scan: {len(paragraphs)}")
+        
         for para in paragraphs:
             para_lower = para.lower()
             
             # Calculate relevance score
             score = 0
+            matched_keywords = []
             for keyword in keywords:
                 if keyword.lower() in para_lower:
-                    score += para_lower.count(keyword.lower())
+                    count = para_lower.count(keyword.lower())
+                    score += count
+                    matched_keywords.append(f"{keyword}({count})")
             
             if score > 0:
                 start = current_pos
                 end = current_pos + len(para)
                 sections.append((start, end, score))
+                # Log first few high-scoring sections for debugging
+                if score >= 3:
+                    preview = para[:100].replace('\n', ' ')
+                    logger.debug(f"  ✓ Found section (score={score}): {preview}... [keywords: {', '.join(matched_keywords)}]")
             
             current_pos += len(para) + 2  # +2 for \n\n
         
         # Sort by relevance score (descending)
         sections.sort(key=lambda x: x[2], reverse=True)
+        
+        logger.info(f"✅ Found {len(sections)} relevant sections for '{field_name}'")
+        if sections:
+            top_5_scores = [s[2] for s in sections[:5]]
+            logger.info(f"   Top 5 relevance scores: {top_5_scores}")
         
         return sections
     
@@ -173,34 +255,62 @@ class MultiTurnExtractor:
         """
         config = self.FIELD_CONFIGS[field_name]
         
+        logger.info(f"\n{'='*60}")
+        logger.info(f"📦 Creating chunk for: {field_name}")
+        logger.info(f"🎯 Max tokens allowed: {max_tokens:,}")
+        
         # Find relevant sections
         relevant_sections = self.find_relevant_sections(full_text, field_name, config)
         
         if not relevant_sections:
             # If no keywords found, use first N tokens
-            logger.warning(f"No relevant sections found for {field_name}, using beginning of document")
+            logger.warning(f"⚠️  No relevant sections found for {field_name}, using beginning of document")
             chunk_text = full_text
         else:
             # Combine relevant sections
             chunk_parts = []
             current_tokens = 0
+            sections_included = 0
+            
+            logger.info(f"📊 Combining sections (highest relevance first)...")
             
             for start, end, score in relevant_sections:
                 section_text = full_text[start:end]
                 section_tokens = self.count_tokens(section_text)
                 
                 if current_tokens + section_tokens > max_tokens:
+                    logger.info(f"   ⛔ Stopped at section {sections_included + 1}: would exceed token limit")
+                    logger.info(f"      (needed {section_tokens:,} more tokens, only {max_tokens - current_tokens:,} available)")
                     break
                 
                 chunk_parts.append(section_text)
                 current_tokens += section_tokens
+                sections_included += 1
+                
+                # Log first few sections being included
+                if sections_included <= 5:
+                    preview = section_text[:80].replace('\n', ' ')
+                    logger.info(f"   ✓ Section {sections_included} (score={score}, tokens={section_tokens:,}): {preview}...")
             
             chunk_text = "\n\n".join(chunk_parts)
+            
+            logger.info(f"✅ Combined {sections_included} sections into chunk")
+            logger.info(f"📏 Initial chunk size: {current_tokens:,} tokens ({len(chunk_text):,} chars)")
         
         # Truncate if still too long
+        truncation_count = 0
         while self.count_tokens(chunk_text) > max_tokens:
             # Remove last 10% of text
             chunk_text = chunk_text[:int(len(chunk_text) * 0.9)]
+            truncation_count += 1
+        
+        if truncation_count > 0:
+            logger.warning(f"⚠️  Truncated chunk {truncation_count} times to fit token limit")
+        
+        final_tokens = self.count_tokens(chunk_text)
+        logger.info(f"📦 Final chunk: {final_tokens:,} tokens ({len(chunk_text):,} chars)")
+        logger.info(f"   Utilization: {(final_tokens/max_tokens)*100:.1f}% of allowed tokens")
+        logger.info(f"{'='*60}\n")
         
         return chunk_text
     

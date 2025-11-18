@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 import os
 
 # Import parsers - use EnhancedClinicalTrialParser for better accuracy
-from enhanced_parser import EnhancedClinicalTrialParser, ClinicalTrialData
+from langgraph.enhanced_parser import EnhancedClinicalTrialParser, ClinicalTrialData
 from clinical_trail_parser import map_sections_to_schema
 
 load_dotenv()
@@ -800,7 +800,7 @@ def extract_from_url(state: WorkflowState) -> WorkflowState:
 
 
 def calculate_metrics(parsed_json: dict) -> tuple[float, float, list]:
-    """Calculate confidence and completeness scores based on meaningful content"""
+    """Calculate confidence and completeness scores based on meaningful content (using word count)"""
     required_fields = [
         "study_overview",
         "brief_description",
@@ -815,7 +815,7 @@ def calculate_metrics(parsed_json: dict) -> tuple[float, float, list]:
     
     filled_fields = 0
     missing_fields = []
-    total_content = 0
+    total_words = 0
     
     for field in required_fields:
         content = parsed_json.get(field, "")
@@ -829,18 +829,20 @@ def calculate_metrics(parsed_json: dict) -> tuple[float, float, list]:
             "no data" not in content.lower() and
             len(content.strip()) > 30):  # Meaningful content threshold
             filled_fields += 1
-            total_content += len(content)
+            # Count words instead of characters
+            word_count = len(content.split())
+            total_words += word_count
         else:
             missing_fields.append(field)
     
     # Completeness: percentage of fields with meaningful data
     completeness_score = filled_fields / len(required_fields) if required_fields else 0.0
     
-    # Confidence: based on average content richness per field
+    # Confidence: based on average word count per field
     if filled_fields > 0:
-        avg_content_length = total_content / filled_fields
-        # Scale confidence: 100 chars = 20%, 500 chars = 100%
-        confidence_score = min(1.0, (avg_content_length - 100) / 400 + 0.2)
+        avg_word_count = total_words / filled_fields
+        # Scale confidence: 20 words = 20%, 100 words = 100%
+        confidence_score = min(1.0, (avg_word_count - 20) / 80 + 0.2)
         confidence_score = max(0.0, confidence_score)  # Ensure non-negative
     else:
         confidence_score = 0.0
@@ -856,8 +858,8 @@ def check_quality(state: WorkflowState) -> Literal["llm_fallback", "chat_node"]:
         return "chat_node"
 
 
-def llm_fallback(state: WorkflowState) -> WorkflowState:
-    """Node: Use LLM to extract missing fields from full document with chunking"""
+def llm_fallback_old(state: WorkflowState) -> WorkflowState:
+    """Node: Use LLM to extract missing fields from full document with chunking (OLD VERSION - KEPT FOR REFERENCE)"""
     try:
         # Mark that LLM fallback is being used
         state["used_llm_fallback"] = True
@@ -942,6 +944,172 @@ Return as JSON. If a field is not found in this chunk, return null for that fiel
     return state
 
 
+def llm_fallback(state: WorkflowState) -> WorkflowState:
+    """Node: Use LLM to extract complete structured data from full PDF with citations and exact content"""
+    try:
+        # Mark that LLM fallback is being used
+        state["used_llm_fallback"] = True
+        
+        # Get full document text
+        if state["input_type"] == "pdf":
+            parser = EnhancedClinicalTrialParser()
+            
+            file_path = state["input_url"]
+            # Handle URLs
+            if file_path.startswith('http'):
+                response = requests.get(file_path)
+                temp_path = f"temp_llm_fallback.pdf"
+                with open(temp_path, 'wb') as f:
+                    f.write(response.content)
+                file_path = temp_path
+            
+            # Extract full text using enhanced parser
+            full_text, metadata = parser.extract_text_multimethod(file_path)
+            
+            # Clean up temp file
+            if state["input_url"].startswith('http'):
+                import os
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+        else:
+            # For URLs, use the raw API data
+            full_text = json.dumps(state["raw_data"], indent=2)
+        
+        # SEND FULL PDF TO GPT-4o - No truncation to ensure complete extraction
+        # GPT-4o can handle very large contexts (128k tokens)
+        print(f"📄 Sending full document to GPT-4o: {len(full_text):,} characters ({len(full_text.split()):,} words)")
+        
+        # Enhanced LLM extraction prompt with citation requirements
+        system_prompt = """You are a clinical trial data extraction expert with deep knowledge of clinical trial protocols.
+
+Your task is to extract structured information from the clinical trial document and create a comprehensive JSON output.
+
+**CRITICAL REQUIREMENTS:**
+1. Extract EXACT text from the original document - do NOT paraphrase or summarize
+2. Include page references, section numbers, or table numbers where information was found
+3. Preserve all technical terminology, drug names, dosages, and measurements exactly as written
+4. If information spans multiple sections, include all relevant content
+5. For tables and structured data, preserve the original format and values
+6. Include protocol version, date, and document identifiers when available
+
+**Required Fields to Extract:**
+
+1. **study_overview**: Extract title, NCT ID, protocol number, version, date, phase, study type, disease/indication
+   
+2. **brief_description**: Extract the study's brief summary or background section (first 500-1000 words)
+
+3. **primary_secondary_objectives**: Extract primary and secondary endpoints with exact outcome measures, time frames, and definitions. Include both efficacy and safety objectives.
+
+4. **treatment_arms_interventions**: Extract all treatment arms, drug names, doses, schedules, administration routes, and combination therapies. Include dosing tables if present.
+
+5. **eligibility_criteria**: Extract complete inclusion and exclusion criteria lists with specific values (age ranges, lab values, prior treatments, etc.)
+
+6. **enrollment_participant_flow**: Extract target enrollment, actual enrollment, patient disposition, screening numbers, and completion rates
+
+7. **adverse_events_profile**: Extract adverse event tables, serious adverse events, Grade 3+ events, and safety monitoring procedures
+
+8. **study_locations**: Extract site names, cities, countries, principal investigators, and contact information
+
+9. **sponsor_information**: Extract sponsor name, medical monitor, CRO information, and collaborators
+
+**Output Format:**
+Return a valid JSON object with the structure:
+{
+  "study_overview": "EXACT TEXT with [Page X, Section Y] citations",
+  "brief_description": "EXACT TEXT with citations",
+  "primary_secondary_objectives": "EXACT TEXT with citations",
+  "treatment_arms_interventions": "EXACT TEXT with citations",
+  "eligibility_criteria": "EXACT TEXT with citations",
+  "enrollment_participant_flow": "EXACT TEXT with citations",
+  "adverse_events_profile": "EXACT TEXT with citations",
+  "study_locations": "EXACT TEXT with citations",
+  "sponsor_information": "EXACT TEXT with citations"
+}
+
+If a field cannot be found in the document, use null instead of an empty string.
+IMPORTANT: Return ONLY the JSON object, no additional text or explanations."""
+
+        # Prepare the full document for LLM
+        user_prompt = f"""Clinical Trial Document (Full Text):
+
+{full_text}
+
+---
+
+Please extract all required fields following the instructions. Include exact text with citations."""
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ]
+        
+        # Invoke LLM with full document
+        print(f"🤖 Calling GPT-4o for extraction...")
+        response = llm.invoke(messages)
+        print(f"✅ GPT-4o response received: {len(response.content)} characters")
+        
+        # Parse LLM response
+        try:
+            # Try to extract JSON from response
+            response_content = response.content.strip()
+            
+            # Remove markdown code blocks if present
+            if response_content.startswith('```json'):
+                response_content = response_content[7:]
+            if response_content.startswith('```'):
+                response_content = response_content[3:]
+            if response_content.endswith('```'):
+                response_content = response_content[:-3]
+            
+            extracted_data = json.loads(response_content.strip())
+            print(f"✅ JSON parsed successfully: {len(extracted_data)} fields extracted")
+            
+            # Debug: Show what was extracted
+            for field, value in extracted_data.items():
+                if value and value != "null" and value:
+                    word_count = len(str(value).split()) if value else 0
+                    print(f"   - {field}: {word_count} words")
+            
+            # Update state with LLM extracted data (replace all fields)
+            for field, value in extracted_data.items():
+                if value and value != "null":
+                    state["parsed_json"][field] = value
+            
+            # Also update data_to_summarize for display
+            field_mapping = {
+                "study_overview": "Study Overview",
+                "brief_description": "Brief Description",
+                "primary_secondary_objectives": "Primary and Secondary Objectives",
+                "treatment_arms_interventions": "Treatment Arms and Interventions",
+                "eligibility_criteria": "Eligibility Criteria",
+                "enrollment_participant_flow": "Enrollment and Participant Flow",
+                "adverse_events_profile": "Adverse Events Profile",
+                "study_locations": "Study Locations",
+                "sponsor_information": "Sponsor Information"
+            }
+            
+            for field, value in extracted_data.items():
+                if value and value != "null":
+                    display_key = field_mapping.get(field, field)
+                    state["data_to_summarize"][display_key] = value
+            
+            print(f"✅ State updated with LLM extracted data")
+            
+        except json.JSONDecodeError as e:
+            # If JSON parsing fails, log error but don't crash
+            print(f"❌ JSON parsing error: {str(e)}")
+            print(f"Response preview: {response.content[:500]}")
+            state["error"] = f"LLM fallback JSON parsing error: {str(e)}. Response preview: {response.content[:200]}"
+        
+        # Recalculate metrics
+        state["confidence_score"], state["completeness_score"], state["missing_fields"] = calculate_metrics(state["parsed_json"])
+        
+    except Exception as e:
+        state["error"] = f"LLM fallback error: {str(e)}"
+    
+    return state
+
+
 def chat_node(state: WorkflowState) -> WorkflowState:
     """Node: Handle chat interactions with Q&A (with streaming support like app_v1)"""
     try:
@@ -951,16 +1119,20 @@ def chat_node(state: WorkflowState) -> WorkflowState:
             # Generate initial summary using EXACT app_v1 prompt
             data_to_summarize = state["data_to_summarize"]
             
-            # Filter sections with meaningful content (same as app_v1)
+            # Filter sections with meaningful content - RELAXED FILTERING
+            # Don't filter out sections that start with "No" - they might have valid data
             sections_to_include = {}
             for section, content in data_to_summarize.items():
                 if (content and 
                     content != "N/A" and 
                     isinstance(content, str) and
-                    "No " not in content[:20] and
-                    "not available" not in content.lower() and
-                    len(content.strip()) > 30):
+                    content.strip() != "" and
+                    len(content.strip()) > 30):  # Only check for minimum length
                     sections_to_include[section] = content
+            
+            # Debug: Print what sections are included
+            print(f"📊 Sections with data for summary: {list(sections_to_include.keys())}")
+            print(f"📊 Total content size: {sum(len(str(v)) for v in sections_to_include.values()):,} characters")
             
             # Prepare consolidated content
             consolidated_content = ""

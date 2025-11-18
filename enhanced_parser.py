@@ -524,8 +524,8 @@ class EnhancedClinicalTrialParser:
             # Remove completely empty rows
             df = df.dropna(how='all')
             
-            # Clean cell values
-            df = df.applymap(lambda x: str(x).strip() if pd.notna(x) else '')
+            # Clean cell values (use map instead of deprecated applymap)
+            df = df.map(lambda x: str(x).strip() if pd.notna(x) else '')
             
             # Convert back to list
             cleaned = [df.columns.tolist()] + df.values.tolist()

@@ -4,7 +4,7 @@ Debug script to test PDF extraction and see why summaries are empty
 
 import os
 import sys
-from langgraph_workflow import build_workflow
+from langgraph.langgraph_workflow import build_workflow
 
 def test_pdf_extraction(pdf_path):
     """Test PDF extraction with full debugging"""

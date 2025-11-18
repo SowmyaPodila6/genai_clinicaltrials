@@ -15,13 +15,13 @@ from dotenv import load_dotenv
 
 # Import local modules
 from clinical_trail_parser import ClinicalTrialPDFParser, map_sections_to_schema
-from prompts import (
+from langgraph.prompts import (
     SUMMARIZATION_SYSTEM_PROMPT, 
     SUMMARY_GENERATION_TEMPLATE,
     QA_SYSTEM_PROMPT,
     QA_TEMPLATE
 )
-from utils import calculate_metrics, filter_meaningful_sections, create_consolidated_content
+from utils.utils import calculate_metrics, filter_meaningful_sections, create_consolidated_content
 
 load_dotenv()
 

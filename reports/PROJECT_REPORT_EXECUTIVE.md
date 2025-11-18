@@ -124,6 +124,241 @@ PDF Parser      URL Extractor
 
 ---
 
+## Detailed Extraction Flow: Parser vs LLM Fallback
+
+### Why LLM Fallback is Essential
+
+Both the parser and LLM can find keywords, but they fundamentally differ in HOW they extract data:
+
+| Aspect | Traditional Parser | LLM Multi-Turn Extractor |
+|--------|-------------------|-------------------------|
+| **Search Scope** | Section titles only | Full document content |
+| **Matching Strategy** | Rigid pattern matching | Semantic understanding |
+| **Section Handling** | One section per field | Combines multiple relevant sections |
+| **Cross-page Content** | Stops at boundaries | Follows content across pages |
+| **Understanding** | WHERE keywords are | WHAT content means |
+
+### Parser Extraction Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              TRADITIONAL PARSER WORKFLOW                     │
+└─────────────────────────────────────────────────────────────┘
+
+Input: PDF Document
+        ↓
+┌───────────────────────────────────────────────┐
+│ STEP 1: Extract Text with Multiple Methods   │
+│  • pdfplumber (layout-aware)                  │
+│  • PyMuPDF (fast extraction)                  │
+│  • pdfminer (complex layouts)                 │
+│  → Selects method with most text extracted   │
+└───────────────────────────────────────────────┘
+        ↓
+┌───────────────────────────────────────────────┐
+│ STEP 2: Detect Section Headers               │
+│  • Regex patterns: "METHODS", "RESULTS"       │
+│  • Numbered sections: "3.1", "4.2"           │
+│  • Confidence scoring (UPPERCASE, length)     │
+│  → Example sections found:                    │
+│    - "ELIGIBILITY CRITERIA"                   │
+│    - "4. SAFETY MONITORING"                   │
+│    - "Study Design"                           │
+└───────────────────────────────────────────────┘
+        ↓
+┌───────────────────────────────────────────────┐
+│ STEP 3: Map Sections to 9 Fields             │
+│  • Searches section TITLES for keywords      │
+│  • Example for "adverse_events_profile":     │
+│    Keywords: ["adverse event", "safety"]     │
+│    ✓ "4. SAFETY MONITORING" → Match!         │
+│    ✗ "Table: Adverse Events" → No match      │
+│                                               │
+│  Problem: Only matches HEADERS, not content  │
+└───────────────────────────────────────────────┘
+        ↓
+┌───────────────────────────────────────────────┐
+│ STEP 4: Extract Section Content              │
+│  • Copies text from section start to end     │
+│  • Stops at next section boundary             │
+│  • Cannot combine multiple sections           │
+│                                               │
+│  Example Result:                              │
+│  "Adverse events will be graded using        │
+│   CTCAE v5.0"  (Only 10 words!)              │
+│                                               │
+│  Missing: AE table, serious events details   │
+└───────────────────────────────────────────────┘
+        ↓
+┌───────────────────────────────────────────────┐
+│ STEP 5: Calculate Quality Metrics            │
+│  • Confidence: 0.35 (too short)              │
+│  • Completeness: 55% (4/9 fields missing)    │
+│  → Triggers LLM Fallback ✅                  │
+└───────────────────────────────────────────────┘
+
+PARSER LIMITATIONS:
+❌ Only searches section TITLES (not full text)
+❌ Cannot combine multiple related sections
+❌ Stops at rigid section boundaries
+❌ No semantic understanding of content
+❌ Misses tables without header keywords
+```
+
+### LLM Multi-Turn Extraction Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│           LLM MULTI-TURN EXTRACTION WORKFLOW                 │
+└─────────────────────────────────────────────────────────────┘
+
+Input: Full PDF Text (150,000 chars)
+        ↓
+┌───────────────────────────────────────────────┐
+│ STEP 1: Split into Paragraphs                │
+│  • Split on \n\n (double newline)            │
+│  • Result: 500 paragraphs detected           │
+└───────────────────────────────────────────────┘
+        ↓
+┌───────────────────────────────────────────────────────────┐
+│ STEP 2: For Each Field, Search ALL Paragraphs            │
+│                                                           │
+│  Example: field = "adverse_events_profile"               │
+│  Keywords: ["adverse event", "safety", "toxicity",       │
+│             "side effect", "AE", "SAE"]                  │
+│                                                           │
+│  Scan 500 paragraphs:                                    │
+│    Para 45:  "Adverse events will be graded..."         │
+│              → Keywords: "adverse events" (2x)           │
+│              → Score: 2 ✅                               │
+│                                                           │
+│    Para 67:  "Table 2: Adverse Events by Grade          │
+│               Grade 1-2: 45%, Grade 3-4: 8%..."        │
+│              → Keywords: "adverse events" (2x)           │
+│              → Score: 2 ✅                               │
+│                                                           │
+│    Para 89:  "Serious adverse events included           │
+│               neutropenia and liver toxicity..."        │
+│              → Keywords: "adverse events" (1x),          │
+│                         "toxicity" (1x)                 │
+│              → Score: 2 ✅                               │
+│                                                           │
+│    Para 120: "Safety profile shows acceptable           │
+│               tolerability with no Grade 5 AE..."      │
+│              → Keywords: "safety" (1x), "AE" (1x)       │
+│              → Score: 2 ✅                               │
+│                                                           │
+│  Result: 19 sections found (sorted by relevance)        │
+└───────────────────────────────────────────────────────────┘
+        ↓
+┌───────────────────────────────────────────────────────────┐
+│ STEP 3: Build Focused Chunk (Greedy Packing)             │
+│                                                           │
+│  Max tokens: 50,000 (field-specific limit)              │
+│                                                           │
+│  Add sections by relevance score:                        │
+│    ✓ Para 45 (score=12, 2,500 tokens) → Total: 2,500   │
+│    ✓ Para 67 (score=8, 1,800 tokens)  → Total: 4,300   │
+│    ✓ Para 89 (score=6, 3,200 tokens)  → Total: 7,500   │
+│    ✓ Para 120 (score=4, 1,500 tokens) → Total: 9,000   │
+│    ... (continues for all relevant sections) ...        │
+│    ✓ Para 340 (score=2, 800 tokens)   → Total: 48,200  │
+│    ✗ Para 401 would exceed 50,000 → STOP               │
+│                                                           │
+│  Final chunk: 17 sections, 48,200 tokens (96.4% util)  │
+└───────────────────────────────────────────────────────────┘
+        ↓
+┌───────────────────────────────────────────────────────────┐
+│ STEP 4: Extract Field with GPT-4o-mini                   │
+│                                                           │
+│  Prompt:                                                  │
+│  "Extract ONLY adverse_events_profile from this text.   │
+│   Include ALL relevant details from the text."          │
+│                                                           │
+│  [Sends 48,200 token chunk to GPT]                      │
+│                                                           │
+│  GPT Response (comprehensive extraction):                │
+│  "Common adverse events include nausea (45% Grade 1-2,  │
+│   8% Grade 3-4), fatigue (38% Grade 1-2, 5% Grade 3-4).│
+│   Serious adverse events included Grade 3 neutropenia   │
+│   (8%) and liver enzyme elevation (5%). Events were     │
+│   graded using CTCAE v5.0. Grade 4-5 events required   │
+│   24-hour reporting. Safety profile shows acceptable    │
+│   tolerability with no treatment-related deaths..."     │
+│                                                           │
+│  Result: 250 words of comprehensive, accurate data ✅   │
+└───────────────────────────────────────────────────────────┘
+        ↓
+┌───────────────────────────────────────────────┐
+│ STEP 5: Wait 2 Seconds (Rate Limit Safety)   │
+└───────────────────────────────────────────────┘
+        ↓
+┌───────────────────────────────────────────────┐
+│ STEP 6: Repeat for Remaining 8 Fields        │
+│  • study_overview                             │
+│  • brief_description                          │
+│  • primary_secondary_objectives               │
+│  • treatment_arms_interventions               │
+│  • eligibility_criteria                       │
+│  • enrollment_participant_flow                │
+│  • study_locations                            │
+│  • sponsor_information                        │
+│                                               │
+│  Each field gets its own focused chunk        │
+│  and separate GPT extraction                  │
+└───────────────────────────────────────────────┘
+        ↓
+┌───────────────────────────────────────────────┐
+│ STEP 7: Final Quality Metrics                │
+│  • Confidence: 0.95 (comprehensive content)   │
+│  • Completeness: 100% (all 9 fields filled)  │
+│  • Total time: 0.9 minutes                    │
+│  • Total cost: $0.039                         │
+│  • Rate limit errors: 0 ✅                   │
+└───────────────────────────────────────────────┘
+
+LLM ADVANTAGES:
+✅ Searches FULL TEXT (all paragraphs)
+✅ Combines multiple relevant sections
+✅ Follows content across page boundaries
+✅ Semantic understanding of relationships
+✅ Captures tables and implicit information
+✅ Zero rate limit errors (sequential processing)
+```
+
+### Key Insight: Content Search vs Title Search
+
+**Parser fails** because it only searches **section HEADERS**:
+```python
+# Parser checks: Does "Safety Monitoring" contain "adverse event"?  
+# Answer: NO → Field remains empty
+```
+
+**LLM succeeds** because it searches **ALL PARAGRAPHS**:
+```python
+# LLM checks: Does paragraph text contain "adverse event"?
+# Answer: YES (found in 19 paragraphs) → Comprehensive extraction
+```
+
+### Real-World Example
+
+**Document structure:**
+```
+SECTION 4: SAFETY MONITORING              ← Parser checks this title only
+Adverse events will be graded using...    ← LLM finds this content
+
+[Table: Adverse Events - 45% Grade 1-2]  ← Parser misses (no header)
+                                          ← LLM finds (content search)
+
+4.1 Serious Events                        ← Parser treats as separate
+Any Grade 4-5 events must be reported... ← LLM combines all related
+```
+
+**Parser result:** 10 words (only section intro)  
+**LLM result:** 250+ words (complete, comprehensive)
+
+---
+
 ## Results & Accuracy
 
 ### Performance Metrics

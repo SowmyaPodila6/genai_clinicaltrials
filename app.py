@@ -7,11 +7,23 @@ import streamlit as st
 import json
 import uuid
 import sqlite3
-from langgraph_workflow import build_workflow, chat_node_stream
+from langgraph.langgraph_workflow import build_workflow, chat_node_stream
 from dotenv import load_dotenv
 import re
 
 load_dotenv()
+
+# Cache the workflow to avoid rebuilding on every page load
+@st.cache_resource
+def get_workflow():
+    """Build and cache the LangGraph workflow for reuse across sessions"""
+    return build_workflow()
+
+# Cache database queries to reduce I/O on page loads
+@st.cache_data(ttl=60)  # Cache for 60 seconds
+def get_cached_conversations():
+    """Get list of conversation IDs from database with caching"""
+    return get_all_conversations()
 
 # Database functions (same as app_v1)
 DB_FILE = "chat_history.db"
@@ -232,7 +244,8 @@ st.set_page_config(
 
 # Initialize session state
 if "workflow_app" not in st.session_state:
-    st.session_state.workflow_app = build_workflow()
+    # Use cached workflow instead of rebuilding every time
+    st.session_state.workflow_app = get_workflow()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -250,7 +263,8 @@ st.markdown("**LangGraph Workflow Edition** | Enter a ClinicalTrials.gov URL or 
 
 # Sidebar
 st.sidebar.header("Past Chats")
-conversations = get_all_conversations()
+# Use cached conversation list for faster sidebar rendering
+conversations = get_cached_conversations()
 for convo_id in conversations:
     if st.sidebar.button(convo_id, key=f"conv_{convo_id}"):
         st.session_state.messages = load_messages_from_db(convo_id)
