@@ -19,7 +19,7 @@ SUMMARY_GENERATION_TEMPLATE = """Generate a concise, well-formatted clinical tri
 - Brief Description: [Extract brief description - 2-3 sentences max]
 
 ### Primary Objectives
-[List main safety and/or efficacy endpoints - bullet points, be specific]
+[List the primary and secondary objectives]
 
 ### Treatment Arms & Interventions
 [Create a simple table if multiple arms exist, otherwise describe briefly]

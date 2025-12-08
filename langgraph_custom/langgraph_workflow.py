@@ -15,6 +15,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import os
 import time
+import logging
 
 # Import parsers - use EnhancedClinicalTrialParser for better accuracy
 from langgraph_custom.enhanced_parser import EnhancedClinicalTrialParser, ClinicalTrialData
@@ -27,7 +28,22 @@ except ImportError:
     MULTI_TURN_AVAILABLE = False
     print("⚠️  multi_turn_extractor not available - falling back to single-call extraction")
 
+# Import RAG tool for clinical trials search
+try:
+    from .rag_tool import create_clinical_trials_rag_tool
+    RAG_TOOL_AVAILABLE = True
+    print("✅ RAG tool loaded successfully")
+except ImportError as e:
+    RAG_TOOL_AVAILABLE = False
+    print(f"⚠️  RAG tool not available - clinical trials similarity search disabled: {e}")
+except Exception as e:
+    RAG_TOOL_AVAILABLE = False
+    print(f"❌ RAG tool failed to load: {e}")
+
 load_dotenv()
+
+# Initialize logger
+logger = logging.getLogger(__name__)
 
 # Initialize LLM with streaming support
 # Using gpt-4o-mini for higher rate limits (200k TPM vs 30k TPM for gpt-4o)
@@ -58,6 +74,12 @@ class WorkflowState(TypedDict):
     extraction_progress: dict  # {"current_field": str, "completed": int, "total": int}
     extraction_cost_estimate: dict  # Cost and time estimates
     progress_log: list  # Real-time progress messages for UI display
+    # RAG tool integration
+    use_rag_tool: bool  # Whether to use RAG tool for this query
+    rag_tool_results: str  # Results from RAG tool search
+    # RAG tool integration
+    use_rag_tool: bool  # Whether to use RAG tool for this query
+    rag_tool_results: str  # Results from RAG tool search
 
 
 def classify_input(state: WorkflowState) -> WorkflowState:
@@ -814,6 +836,104 @@ def extract_from_url(state: WorkflowState) -> WorkflowState:
     return state
 
 
+def should_use_rag_tool(query: str) -> bool:
+    """Determine if a query should use the RAG tool for clinical trials search"""
+    if not query or not RAG_TOOL_AVAILABLE:
+        return False
+    
+    # Ensure query is a string
+    if isinstance(query, dict):
+        query = str(query)
+    elif not isinstance(query, str):
+        query = str(query)
+    
+    query_lower = query.lower()
+    
+    # Keywords that indicate a drug/treatment similarity search
+    rag_keywords = [
+        'similar studies', 'similar trials', 'other studies', 'other trials',
+        'comparable', 'related studies', 'related trials', 'find studies',
+        'search studies', 'trials using', 'studies using', 'studies with',
+        'trials with', 'similar drugs', 'other drugs', 'alternative treatments',
+        'comparable drugs', 'related treatments', 'what other', 'are there other',
+        'show me studies', 'find trials', 'search trials', 'clinical trials using'
+    ]
+    
+    # Drug-related terms that might indicate searching for similar treatments
+    drug_terms = [
+        'drug', 'medication', 'treatment', 'therapy', 'intervention',
+        'pembrolizumab', 'nivolumab', 'atezolizumab', 'durvalumab',
+        'immunotherapy', 'checkpoint inhibitor', 'monoclonal antibody',
+        'chemotherapy', 'targeted therapy', 'anti-pd1', 'anti-pdl1'
+    ]
+    
+    # Check for RAG keywords
+    has_rag_keyword = any(keyword in query_lower for keyword in rag_keywords)
+    
+    # Check for drug terms
+    has_drug_term = any(term in query_lower for term in drug_terms)
+    
+    # Use RAG if we have both similarity intent and drug-related terms
+    return has_rag_keyword and has_drug_term
+
+
+def extract_drug_name_from_query(query: str) -> str:
+    """Extract drug name from user query"""
+    import re
+    
+    # Ensure query is a string
+    if isinstance(query, dict):
+        query = str(query)
+    elif not isinstance(query, str):
+        query = str(query)
+    
+    query_lower = query.lower()
+    
+    # Common drug name patterns
+    known_drugs = [
+        'pembrolizumab', 'nivolumab', 'atezolizumab', 'durvalumab',
+        'ipilimumab', 'avelumab', 'cemiplimab', 'dostarlimab',
+        'bevacizumab', 'trastuzumab', 'rituximab', 'cetuximab',
+        'panitumumab', 'ramucirumab', 'necitumumab'
+    ]
+    
+    # Look for known drug names
+    for drug in known_drugs:
+        if drug in query_lower:
+            return drug
+    
+    # Try to extract drug names using patterns
+    # Look for -mab suffix (monoclonal antibodies)
+    mab_pattern = r'\b(\w+mab)\b'
+    mab_matches = re.findall(mab_pattern, query_lower)
+    if mab_matches:
+        return mab_matches[0]
+    
+    # Look for words after "using", "with", "drug", etc.
+    patterns = [
+        r'using\s+(\w+)',
+        r'with\s+(\w+)',
+        r'drug\s+(\w+)',
+        r'medication\s+(\w+)',
+        r'treatment\s+(\w+)',
+        r'therapy\s+(\w+)'
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, query_lower)
+        if matches and len(matches[0]) > 3:  # Avoid short words
+            return matches[0]
+    
+    # Default to extracting the most likely drug name
+    words = query.split()
+    for word in words:
+        word_clean = re.sub(r'[^a-zA-Z]', '', word).lower()
+        if len(word_clean) > 4 and word_clean.endswith(('mab', 'nib', 'tib', 'zumab')):
+            return word_clean
+    
+    return ""
+
+
 def calculate_metrics(parsed_json: dict) -> tuple[float, float, list]:
     """Calculate confidence and completeness scores based on meaningful content (using word count)"""
     required_fields = [
@@ -831,21 +951,39 @@ def calculate_metrics(parsed_json: dict) -> tuple[float, float, list]:
     filled_fields = 0
     missing_fields = []
     total_words = 0
+    field_debug_info = {}
     
     for field in required_fields:
-        content = parsed_json.get(field, "")
+        raw_value = parsed_json.get(field, "")
+        
+        # Extract content from dict format or use string directly
+        if isinstance(raw_value, dict):
+            content = raw_value.get("content", "")
+        else:
+            content = raw_value
+        
+        # Ensure content is a string
+        if not isinstance(content, str):
+            content = str(content) if content else ""
+        
+        # Get word count for debugging
+        word_count = len(content.split()) if content else 0
+        field_debug_info[field] = {
+            "chars": len(content),
+            "words": word_count,
+            "has_content": bool(content and content.strip())
+        }
         
         # Check for meaningful content (not just "N/A" or short placeholders)
+        # Lower threshold from 30 to 10 characters to catch more valid extractions
         if (content and 
-            isinstance(content, str) and
             content.strip() != "N/A" and
             content.strip() != "" and
+            content.strip() != "Not found in provided text" and
             "not available" not in content.lower() and
             "no data" not in content.lower() and
-            len(content.strip()) > 30):  # Meaningful content threshold
+            len(content.strip()) > 10):  # Lowered threshold from 30 to 10
             filled_fields += 1
-            # Count words instead of characters
-            word_count = len(content.split())
             total_words += word_count
         else:
             missing_fields.append(field)
@@ -856,11 +994,17 @@ def calculate_metrics(parsed_json: dict) -> tuple[float, float, list]:
     # Confidence: based on average word count per field
     if filled_fields > 0:
         avg_word_count = total_words / filled_fields
-        # Scale confidence: 20 words = 20%, 100 words = 100%
-        confidence_score = min(1.0, (avg_word_count - 20) / 80 + 0.2)
-        confidence_score = max(0.0, confidence_score)  # Ensure non-negative
+        # More generous confidence scaling: 15 words = 30%, 50 words = 70%, 100+ = 95%
+        confidence_score = min(0.95, (avg_word_count - 15) / 85 + 0.3)
+        confidence_score = max(0.1, confidence_score)  # Ensure minimum 10% if any content
     else:
         confidence_score = 0.0
+    
+    # Log debug info - commented out to avoid logger issues
+    # logger.debug(f"Metrics calculation debug:")
+    # for field, info in field_debug_info.items():
+    #     logger.debug(f"  {field}: {info['words']} words, {info['chars']} chars, has_content={info['has_content']}")
+    # logger.debug(f"Filled fields: {filled_fields}/{len(required_fields)}, total_words: {total_words}")
     
     return confidence_score, completeness_score, missing_fields
 
@@ -1006,6 +1150,9 @@ def llm_fallback(state: WorkflowState) -> WorkflowState:
         
         log_progress(f"📄 Document size: {len(full_text):,} characters ({len(full_text.split()):,} words)")
         
+        # Cache full text for later use (like re-extraction)
+        state["full_text"] = full_text
+        
         # Estimate cost and time for multi-turn extraction
         if MULTI_TURN_AVAILABLE:
             cost_estimate = estimate_extraction_cost(full_text, model="gpt-4o-mini")
@@ -1062,10 +1209,47 @@ def llm_fallback(state: WorkflowState) -> WorkflowState:
         
         log_progress(f"📊 Total extracted: {total_words:,} words")
         
-        # Update state with LLM extracted data (replace all fields)
+        # Update state with LLM extracted data (replace all fields) and enhance with page tracking
+        full_text_for_pages = state.get("full_text", full_text)
+        
         for field, value in extracted_data.items():
             if value and value != "null" and value:
-                state["parsed_json"][field] = value
+                # If the value is already a dict with page_references, keep it
+                if isinstance(value, dict) and "page_references" in value:
+                    state["parsed_json"][field] = value
+                else:
+                    # Extract page numbers for this content
+                    content_str = value if isinstance(value, str) else str(value)
+                    page_refs = []
+                    
+                    # Try to extract page numbers from the full text
+                    if full_text_for_pages and len(content_str) > 20:
+                        import re
+                        # Find page markers around content snippets
+                        content_words = content_str.lower().split()[:15]  # First 15 words
+                        for i, word in enumerate(content_words):
+                            if len(word) > 4:  # Skip small words
+                                # Find this word in the full text and get surrounding page markers
+                                pattern = re.escape(word)
+                                matches = list(re.finditer(pattern, full_text_for_pages, re.IGNORECASE))
+                                for match in matches[:3]:  # Check first 3 matches
+                                    # Look backwards for page marker
+                                    text_before = full_text_for_pages[:match.start()]
+                                    page_matches = list(re.finditer(r'--- Page (\\d+) ---', text_before))
+                                    if page_matches:
+                                        try:
+                                            page_num = int(page_matches[-1].group(1))
+                                            page_refs.append(page_num)
+                                        except (ValueError, IndexError):
+                                            continue
+                    
+                    # Create enhanced value with page references
+                    enhanced_value = {
+                        "content": content_str,
+                        "page_references": sorted(list(set(page_refs))) if page_refs else []
+                    }
+                    
+                    state["parsed_json"][field] = enhanced_value
         
         # Also update data_to_summarize for display
         field_mapping = {
@@ -1083,7 +1267,15 @@ def llm_fallback(state: WorkflowState) -> WorkflowState:
         for field, value in extracted_data.items():
             if value and value != "null" and value:
                 display_key = field_mapping.get(field, field)
-                state["data_to_summarize"][display_key] = value
+                
+                # Handle both dict format (with page_references) and string format
+                if isinstance(state["parsed_json"][field], dict):
+                    content = state["parsed_json"][field].get("content", "")
+                else:
+                    content = str(value) if value else ""
+                
+                if content and content.strip():
+                    state["data_to_summarize"][display_key] = content
         
         log_progress(f"✅ State updated with extracted data")
         
@@ -1161,8 +1353,28 @@ Extract all required fields following the instructions."""
     # Invoke LLM with full document
     response = llm.invoke(messages)
     
-    # Parse LLM response
-    response_content = response.content.strip()
+    # Parse LLM response - safely handle different content types
+    raw_content = response.content
+    if isinstance(raw_content, str):
+        response_content = raw_content.strip()
+    elif isinstance(raw_content, dict):
+        response_content = json.dumps(raw_content)
+    elif isinstance(raw_content, list):
+        # Handle list of content blocks
+        text_parts = []
+        for item in raw_content:
+            if isinstance(item, str):
+                text_parts.append(item)
+            elif isinstance(item, dict):
+                if "text" in item:
+                    text_parts.append(item["text"])
+                else:
+                    text_parts.append(json.dumps(item))
+            else:
+                text_parts.append(str(item))
+        response_content = "".join(text_parts).strip()
+    else:
+        response_content = str(raw_content).strip() if raw_content else ""
     
     # Remove markdown code blocks if present
     if response_content.startswith('```json'):
@@ -1182,6 +1394,80 @@ def chat_node(state: WorkflowState) -> WorkflowState:
     try:
         query = state.get("chat_query", "")
         
+        # Ensure query is a string
+        if isinstance(query, dict):
+            query = str(query)
+        elif not isinstance(query, str):
+            query = str(query)
+        
+        # Check if query should use RAG tool for clinical trials search
+        if query and query != "generate_summary" and should_use_rag_tool(query):
+            print(f"🔍 Detected RAG query: {query}")
+            
+            # Extract drug name from query
+            drug_name = extract_drug_name_from_query(query)
+            
+            if drug_name and RAG_TOOL_AVAILABLE:
+                try:
+                    # Initialize RAG tool
+                    rag_tool = create_clinical_trials_rag_tool()
+                    
+                    # Search for similar studies
+                    rag_results = rag_tool._run(
+                        drug_name=drug_name,
+                        n_results=8,  # Get more results for better context
+                        conditions=None  # Could be enhanced to extract conditions from query
+                    )
+                    
+                    # Store RAG results
+                    state["rag_tool_results"] = rag_results
+                    state["use_rag_tool"] = True
+                    
+                    # Create enhanced response using both study data and RAG results
+                    data_to_summarize = state["data_to_summarize"]
+                    context = json.dumps(data_to_summarize, indent=2)
+                    
+                    enhanced_prompt = f"""You are a clinical research assistant. The user asked: "{query}"
+
+You have access to two sources of information:
+
+1. **Current Study Data:**
+{context}
+
+2. **Similar Clinical Trials from Database Search:**
+{rag_results}
+
+**Instructions:**
+- First, answer the user's question about similar studies using the database search results
+- Then, if relevant, relate it back to the current study data
+- Be specific about study NCT IDs, drug names, and provide clickable URLs
+- Highlight key similarities and differences
+- Keep the response well-organized and informative
+
+Please provide a comprehensive answer that addresses the user's question about similar studies."""
+                    
+                    messages = [
+                        SystemMessage(content="You are a clinical research assistant expert at finding and explaining clinical trial similarities. Provide detailed, well-formatted responses with specific study references and URLs."),
+                        HumanMessage(content=enhanced_prompt)
+                    ]
+                    
+                    # Generate response with RAG context
+                    response_text = ""
+                    for chunk in llm.stream(messages):
+                        if hasattr(chunk, 'content'):
+                            response_text += chunk.content
+                    
+                    state["chat_response"] = response_text
+                    return state
+                    
+                except Exception as e:
+                    print(f"⚠️  RAG tool error: {e}")
+                    # Fall back to normal chat processing
+                    state["use_rag_tool"] = False
+            else:
+                print(f"⚠️  Could not extract drug name from query: {query}")
+                state["use_rag_tool"] = False
+        
         if not query or query == "generate_summary":
             # Generate initial summary using EXACT app_v1 prompt
             data_to_summarize = state["data_to_summarize"]
@@ -1189,10 +1475,19 @@ def chat_node(state: WorkflowState) -> WorkflowState:
             # Filter sections with meaningful content - RELAXED FILTERING
             # Don't filter out sections that start with "No" - they might have valid data
             sections_to_include = {}
-            for section, content in data_to_summarize.items():
+            for section, raw_content in data_to_summarize.items():
+                # Extract content from dict format or use string directly
+                if isinstance(raw_content, dict):
+                    content = raw_content.get("content", "")
+                else:
+                    content = raw_content
+                
+                # Ensure content is a string
+                if not isinstance(content, str):
+                    content = str(content) if content else ""
+                
                 if (content and 
                     content != "N/A" and 
-                    isinstance(content, str) and
                     content.strip() != "" and
                     len(content.strip()) > 30):  # Only check for minimum length
                     sections_to_include[section] = content
@@ -1207,7 +1502,14 @@ def chat_node(state: WorkflowState) -> WorkflowState:
                 consolidated_content += f"\n\n**{section}:**\n{content}\n"
             
             # EXACT prompt from app_v1
-            study_title = data_to_summarize.get('Study Overview', '').split('|')[0].strip() if data_to_summarize.get('Study Overview') else 'Clinical Trial Protocol'
+            study_overview = data_to_summarize.get('Study Overview', '')
+            # Handle both dict and string formats
+            if isinstance(study_overview, dict):
+                study_overview = study_overview.get('content', '')
+            if isinstance(study_overview, str) and study_overview:
+                study_title = study_overview.split('|')[0].strip()
+            else:
+                study_title = 'Clinical Trial Protocol'
             
             concise_prompt = f"""Generate a concise, well-formatted clinical trial summary using ONLY the information provided below. Follow this structure and format:
 
@@ -1306,9 +1608,21 @@ def chat_node_stream(state: WorkflowState) -> Iterator[str]:
             
             consolidated_content = ""
             for section, content in sections_to_include.items():
+                # Ensure content is a string before adding to consolidated content
+                if isinstance(content, dict):
+                    content = content.get('content', str(content))
+                if not isinstance(content, str):
+                    content = str(content) if content else ""
                 consolidated_content += f"\n\n**{section}:**\n{content}\n"
             
-            study_title = data_to_summarize.get('Study Overview', '').split('|')[0].strip() if data_to_summarize.get('Study Overview') else 'Clinical Trial Protocol'
+            # Handle both dict and string formats for study title
+            study_overview_raw = data_to_summarize.get('Study Overview', '')
+            if isinstance(study_overview_raw, dict):
+                study_overview_raw = study_overview_raw.get('content', '')
+            # Ensure study_overview_raw is a string before calling split
+            if not isinstance(study_overview_raw, str):
+                study_overview_raw = str(study_overview_raw) if study_overview_raw else ''
+            study_title = study_overview_raw.split('|')[0].strip() if study_overview_raw else 'Clinical Trial Protocol'
             
             concise_prompt = f"""Generate a concise, well-formatted clinical trial summary using ONLY the information provided below. Follow this structure and format:
 
@@ -1476,7 +1790,9 @@ if __name__ == "__main__":
         "chat_query": "generate_summary",
         "chat_response": "",
         "stream_response": None,
-        "error": ""
+        "error": "",
+        "use_rag_tool": False,
+        "rag_tool_results": ""
     })
     
     print(json.dumps(result, indent=2, default=str))

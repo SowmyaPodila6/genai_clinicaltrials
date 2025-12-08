@@ -40,6 +40,8 @@ DB_FILE = "chat_history.db"
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    
+    # Create base table first
     c.execute('''
         CREATE TABLE IF NOT EXISTS chat_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,14 +50,54 @@ def get_db_connection():
             content TEXT NOT NULL
         )
     ''')
+    
+    # Check if new columns exist and add them if they don't
+    c.execute("PRAGMA table_info(chat_messages)")
+    columns = [row[1] for row in c.fetchall()]
+    
+    if 'message_type' not in columns:
+        c.execute('ALTER TABLE chat_messages ADD COLUMN message_type TEXT DEFAULT "text"')
+    
+    if 'metadata' not in columns:
+        c.execute('ALTER TABLE chat_messages ADD COLUMN metadata TEXT DEFAULT NULL')
+        
+    if 'timestamp' not in columns:
+        # Add timestamp column without default first
+        c.execute('ALTER TABLE chat_messages ADD COLUMN timestamp TIMESTAMP')
+        # Then update existing rows to have a timestamp
+        c.execute('UPDATE chat_messages SET timestamp = datetime("now") WHERE timestamp IS NULL')
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS extraction_states (
+            conversation_id TEXT PRIMARY KEY,
+            state_json TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT (datetime('now'))
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS uploaded_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            original_filename TEXT NOT NULL,
+            stored_filepath TEXT NOT NULL,
+            file_size INTEGER,
+            upload_timestamp TIMESTAMP DEFAULT (datetime('now')),
+            FOREIGN KEY (conversation_id) REFERENCES extraction_states (conversation_id)
+        )
+    ''')
     conn.commit()
     return conn
 
-def save_message_to_db(conversation_id, role, content):
+def save_message_to_db(conversation_id, role, content, message_type="text", metadata=None):
+    import json
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("INSERT INTO chat_messages (conversation_id, role, content) VALUES (?, ?, ?)", 
-              (conversation_id, role, content))
+    metadata_json = json.dumps(metadata) if metadata else None
+    # Use datetime("now") for SQLite timestamp
+    c.execute("""INSERT INTO chat_messages 
+                 (conversation_id, role, content, message_type, metadata, timestamp) 
+                 VALUES (?, ?, ?, ?, ?, datetime('now'))""", 
+              (conversation_id, role, content, message_type, metadata_json))
     conn.commit()
     conn.close()
 
@@ -68,6 +110,65 @@ def load_messages_from_db(conversation_id):
     conn.close()
     return messages
 
+def save_extraction_state(conversation_id, state):
+    """Save extraction state to database"""
+    import json
+    conn = get_db_connection()
+    c = conn.cursor()
+    # Only save serializable state data (excluding full_text for storage efficiency)
+    state_to_save = {
+        "parsed_json": state.get("parsed_json", {}),
+        "parser_only_json": state.get("parser_only_json", {}),
+        "data_to_summarize": state.get("data_to_summarize", {}),
+        "confidence_score": state.get("confidence_score", 0.0),
+        "completeness_score": state.get("completeness_score", 0.0),
+        "missing_fields": state.get("missing_fields", []),
+        "nct_id": state.get("nct_id", ""),
+        "input_type": state.get("input_type", "unknown"),
+        "input_url": state.get("input_url", ""),  # Save for re-extraction attempts
+        "used_llm_fallback": state.get("used_llm_fallback", False),
+        "extraction_cost_estimate": state.get("extraction_cost_estimate", {}),
+    }
+    state_json = json.dumps(state_to_save)
+    c.execute("""INSERT OR REPLACE INTO extraction_states 
+                 (conversation_id, state_json, updated_at) 
+                 VALUES (?, ?, datetime('now'))""", 
+              (conversation_id, state_json))
+    conn.commit()
+    conn.close()
+
+def save_uploaded_file(conversation_id, original_filename, stored_filepath, file_size):
+    """Save uploaded file information to database"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("INSERT INTO uploaded_files (conversation_id, original_filename, stored_filepath, file_size) VALUES (?, ?, ?, ?)", 
+              (conversation_id, original_filename, stored_filepath, file_size))
+    conn.commit()
+    conn.close()
+
+def get_uploaded_file_path(conversation_id):
+    """Get stored file path for a conversation"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT stored_filepath, original_filename FROM uploaded_files WHERE conversation_id = ? ORDER BY upload_timestamp DESC LIMIT 1", 
+              (conversation_id,))
+    row = c.fetchone()
+    conn.close()
+    return row if row else None
+
+def load_extraction_state(conversation_id):
+    """Load extraction state from database"""
+    import json
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT state_json FROM extraction_states WHERE conversation_id = ?", 
+              (conversation_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return json.loads(row[0])
+    return None
+
 def get_all_conversations():
     conn = get_db_connection()
     c = conn.cursor()
@@ -77,14 +178,19 @@ def get_all_conversations():
     return conversations
 
 def new_chat_click():
+    """Callback for starting a new chat - sets flag for main flow to handle rerun"""
     st.session_state.messages = []
     st.session_state.current_convo_id = str(uuid.uuid4())
     st.session_state.url_key = str(uuid.uuid4())
     st.session_state.current_state = None
-    st.rerun()
+    st.session_state.cached_full_text = None
+    st.session_state.approved_fields = {}
+    st.session_state.refinement_requests = {}
+    # Set flag to trigger rerun in main flow (st.rerun() doesn't work in callbacks)
+    st.session_state.new_chat_requested = True
 
-def create_metrics_message(state):
-    """Create a formatted metrics message from workflow state with tabs for parser vs LLM"""
+def create_extraction_results_tabs(state):
+    """Create tabbed extraction results with Metrics and View JSON tabs"""
     confidence = state.get("confidence_score", 0)
     completeness = state.get("completeness_score", 0)
     missing_fields = state.get("missing_fields", [])
@@ -92,51 +198,574 @@ def create_metrics_message(state):
     input_type = state.get("input_type", "unknown")
     parsed_json = state.get("parsed_json", {})
     used_llm_fallback = state.get("used_llm_fallback", False)
-    
-    # Get parser-only data if available
     parser_json = state.get("parser_only_json", {})
     
     # Count filled fields
     total_fields = 9
     filled_fields = total_fields - len(missing_fields)
     
-    all_fields = [
-        "study_overview",
-        "brief_description",
-        "primary_secondary_objectives",
-        "treatment_arms_interventions",
-        "eligibility_criteria",
-        "enrollment_participant_flow",
-        "adverse_events_profile",
-        "study_locations",
-        "sponsor_information"
-    ]
+    # Initialize active tab in session state if not exists
+    if "active_extraction_tab" not in st.session_state.ui_state:
+        st.session_state.ui_state["active_extraction_tab"] = 0  # Default to first tab
     
-    message = f"""
-### 📊 Extraction Metrics
-
-**Study ID:** {nct_id}  
-**Input Type:** {input_type.upper()}  
-**Extraction Method:** {'🤖 Parser + LLM (Multi-turn)' if used_llm_fallback else '📄 Parser Only'}
-
-**Final Quality Scores:**
-- **Confidence Score:** {confidence:.1%} {'✅' if confidence >= 0.7 else '⚠️' if confidence >= 0.5 else '❌'}
-- **Completeness Score:** {completeness:.1%} {'✅' if completeness >= 0.9 else '⚠️' if completeness >= 0.6 else '❌'}
-- **Extracted Fields:** {filled_fields}/{total_fields}
-"""
+    # Create tabs with selection state
+    tab_names = ["📊 Extraction Metrics", "📄 View JSON"]
+    selected_tab = st.radio(
+        "Select View", 
+        options=list(range(len(tab_names))),
+        format_func=lambda x: tab_names[x],
+        index=st.session_state.ui_state["active_extraction_tab"],
+        horizontal=True,
+        key="extraction_tab_selector",
+        label_visibility="collapsed"
+    )
     
-    if used_llm_fallback:
-        cost_est = state.get("extraction_cost_estimate", {})
-        if cost_est:
-            message += f"\n**💰 Multi-turn Extraction:**\n"
-            message += f"- Cost: ${cost_est.get('total_cost', 0):.3f}\n"
-            message += f"- Time: {cost_est.get('estimated_time_minutes', 0):.1f} min\n"
-            message += f"- Tokens: {cost_est.get('total_tokens', 0):,}\n"
+    # Update session state with current selection
+    st.session_state.ui_state["active_extraction_tab"] = selected_tab
+    
+    # Add some spacing
+    st.markdown("")
+    
+    # Render content based on selected tab
+    if selected_tab == 0:  # Metrics tab
+        # Study Info
+        col_a, col_b = st.columns([1, 1])
+        with col_a:
+            st.markdown(f"**Study ID:** {nct_id}")
+            st.markdown(f"**Input Type:** {input_type.upper()}")
+        with col_b:
+            st.markdown(f"**Extraction Method:**")
+            st.markdown(f"{'🤖 Parser + LLM (Multi-turn)' if used_llm_fallback else '📄 Parser Only'}")
         
-        # Add comparison note
-        message += f"\n---\n**📋 View extraction comparison in tabs below**\n"
+        st.divider()
+        
+        # Show metrics in columns
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric(
+                "Confidence", 
+                f"{confidence:.1%}",
+                delta="High" if confidence > 0.7 else "Low"
+            )
+        with col2:
+            st.metric(
+                "Completeness", 
+                f"{completeness:.1%}",
+                delta="Excellent" if completeness >= 0.9 else "Good" if completeness >= 0.6 else "Poor"
+            )
+        with col3:
+            st.metric(
+                "Fields Extracted",
+                f"{filled_fields}/{total_fields}"
+            )
+        
+        # Show missing fields if any
+        if missing_fields:
+            st.warning(f"**Missing {len(missing_fields)} fields:**")
+            for field in missing_fields[:5]:
+                st.write(f"• {field.replace('_', ' ').title()}")
+        else:
+            st.success("✅ All fields extracted successfully!")
+        
+        # Show LLM extraction details if used
+        if used_llm_fallback:
+            cost_est = state.get("extraction_cost_estimate", {})
+            if cost_est:
+                st.divider()
+                st.markdown("**💰 Multi-turn Extraction Details:**")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Cost", f"${cost_est.get('total_cost', 0):.3f}")
+                with col2:
+                    st.metric("Time", f"{cost_est.get('estimated_time_minutes', 0):.1f} min")
+                with col3:
+                    st.metric("Tokens", f"{cost_est.get('total_tokens', 0):,}")
     
-    return message
+    elif selected_tab == 1:  # View JSON tab
+        # Call existing JSON view function
+        create_json_view_tabs(state)
+        
+        # Add regenerate summary button at the bottom
+        st.divider()
+        st.markdown("### 🔄 Regenerate Summary")
+        st.caption("After reviewing and refining the extracted fields, click below to regenerate the summary with updated data")
+        
+        if st.button("🔄 Regenerate Summary", key="regenerate_summary_btn", use_container_width=True, type="primary"):
+            _regenerate_summary(state)
+
+def create_json_view_tabs(state):
+    """Create tabs for viewing JSON data with collapsible sections"""
+    parsed_json = state.get("parsed_json", {})
+    parser_json = state.get("parser_only_json", {})
+    used_llm = state.get("used_llm_fallback", False)
+    nct_id = state.get("nct_id", "study")
+    
+    # Define field metadata
+    field_info = {
+        "study_overview": {"icon": "📋", "title": "Study Overview"},
+        "brief_description": {"icon": "📝", "title": "Brief Description"},
+        "primary_secondary_objectives": {"icon": "🎯", "title": "Primary & Secondary Objectives"},
+        "treatment_arms_interventions": {"icon": "💊", "title": "Treatment Arms & Interventions"},
+        "eligibility_criteria": {"icon": "✅", "title": "Eligibility Criteria"},
+        "enrollment_participant_flow": {"icon": "👥", "title": "Enrollment & Participant Flow"},
+        "adverse_events_profile": {"icon": "⚠️", "title": "Adverse Events Profile"},
+        "study_locations": {"icon": "📍", "title": "Study Locations"},
+        "sponsor_information": {"icon": "🏢", "title": "Sponsor Information"}
+    }
+    
+    if used_llm and parser_json:
+        # Create tabs for parser vs LLM comparison
+        tab1, tab2 = st.tabs(["🤖 Final JSON (LLM Enhanced)", "📄 Parser Output"])
+        
+        with tab1:
+            st.markdown("**LLM-Enhanced Extraction Results**")
+            _render_json_sections(parsed_json, field_info, "llm")
+            
+            # Download button
+            json_str = json.dumps(parsed_json, indent=2)
+            st.download_button(
+                label="📥 Download LLM JSON",
+                data=json_str,
+                file_name=f"llm_enhanced_{nct_id}.json",
+                mime="application/json",
+                key="download_llm_json",
+                use_container_width=True
+            )
+        
+        with tab2:
+            st.markdown("**Initial Parser Extraction (Before LLM)")
+            _render_json_sections(parser_json, field_info, "parser")
+            
+            # Download button
+            parser_json_str = json.dumps(parser_json, indent=2)
+            st.download_button(
+                label="📥 Download Parser JSON",
+                data=parser_json_str,
+                file_name=f"parser_only_{nct_id}.json",
+                mime="application/json",
+                key="download_parser_json",
+                use_container_width=True
+            )
+    else:
+        # Single tab for parser-only results
+        st.markdown("**📊 Extracted Data (JSON Format)**")
+        _render_json_sections(parsed_json, field_info, "parsed")
+        
+        # Download button
+        json_str = json.dumps(parsed_json, indent=2)
+        st.download_button(
+            label="📥 Download JSON",
+            data=json_str,
+            file_name=f"extracted_data_{nct_id}.json",
+            mime="application/json",
+            key="download_json",
+            use_container_width=True
+        )
+
+def _render_json_sections(json_data, field_info, prefix):
+    """Render collapsible sections for each JSON field with human-in-the-loop review"""
+    if not json_data:
+        st.info("No data extracted")
+        return
+    
+    for field, value in json_data.items():
+        info = field_info.get(field, {"icon": "📄", "title": field.replace('_', ' ').title()})
+        icon = info["icon"]
+        title = info["title"]
+        
+        # Handle both old string format and new dict format with page references
+        if isinstance(value, dict):
+            content = value.get("content", "")
+            page_refs = value.get("page_references", [])
+        else:
+            content = str(value) if value else ""
+            page_refs = []
+        
+        # Ensure content is always a string
+        if not isinstance(content, str):
+            content = str(content) if content else ""
+        
+        # Check if field has data
+        has_data = content and content.strip() and len(content.strip()) > 10
+        status = "✅" if has_data else "❌"
+        
+        # Create expander with enhanced page reference info
+        if page_refs:
+            page_info = f" 📄 Pages: {', '.join(map(str, page_refs))}"
+            page_color = "🟢" if len(page_refs) > 1 else "🔵"
+        else:
+            page_info = " ❓ No page refs"
+            page_color = "⚪"
+        
+        with st.expander(f"{icon} {title} {status}{page_info}", expanded=False):
+            if has_data:
+                # Enhanced metadata section
+                col1, col2, col3 = st.columns([1, 1, 1])
+                with col1:
+                    # Safely handle content split - ensure it's a string
+                    word_count = len(str(content).split()) if content else 0
+                    st.caption(f"📊 **{word_count:,} words**")
+                with col2:
+                    if page_refs:
+                        page_display = ", ".join(map(str, page_refs))
+                        st.caption(f"📄 **Pages: {page_display}**")
+                    else:
+                        st.caption("📄 **No page references**")
+                with col3:
+                    # Show data quality indicator
+                    if len(page_refs) > 1:
+                        st.caption("✨ **Multi-page extraction**")
+                    elif len(page_refs) == 1:
+                        st.caption("📍 **Single-page source**")
+                    else:
+                        st.caption("⚠️ **Missing page info**")
+                
+                # Show content in a text area for easy copying
+                st.text_area(
+                    label="Content",
+                    value=content,
+                    height=250,  # Increased height for better readability
+                    key=f"{prefix}_{field}_content",
+                    label_visibility="collapsed"
+                )
+                
+                # Add content analysis
+                if page_refs:
+                    with st.expander("🔍 **Content Analysis**", expanded=False):
+                        st.markdown(f"**Source Quality:** {'High' if len(page_refs) > 1 else 'Medium' if len(page_refs) == 1 else 'Low'}")
+                        st.markdown(f"**Page Coverage:** {len(page_refs)} page(s) referenced")
+                        st.markdown(f"**Content Length:** {word_count:,} words ({len(str(content)):,} characters)")
+                        
+                        if len(page_refs) > 1:
+                            st.success("✅ Multi-page extraction suggests comprehensive coverage")
+                        elif len(page_refs) == 1:
+                            st.info("ℹ️ Single-page source - may be concise or incomplete")
+                        else:
+                            st.warning("⚠️ No page tracking - extraction quality uncertain")
+                
+                # Human-in-the-loop review section
+                st.markdown("---")
+                st.markdown("**🔍 Review Extraction**")
+                
+                col_approve, col_refine = st.columns([1, 2])
+                
+                with col_approve:
+                    approve_btn = st.button(
+                        "✅ Approve",
+                        key=f"approve_{prefix}_{field}",
+                        help="Mark this extraction as correct",
+                        use_container_width=True
+                    )
+                    
+                    if approve_btn:
+                        st.success("Approved!")
+                        # Store approval in session state
+                        if "approved_fields" not in st.session_state:
+                            st.session_state.approved_fields = {}
+                        st.session_state.approved_fields[field] = True
+                
+                with col_refine:
+                    refine_btn = st.button(
+                        "🔧 Request Refinement",
+                        key=f"refine_{prefix}_{field}",
+                        help="Provide feedback to improve this extraction",
+                        use_container_width=True
+                    )
+                
+                # Show refinement interface if button clicked or if recently re-extracted
+                show_refine_ui = (refine_btn or 
+                                st.session_state.get(f"show_refine_{field}", False) or 
+                                st.session_state.get(f"reextracted_{field}", False))
+                
+                if show_refine_ui:
+                    st.session_state[f"show_refine_{field}"] = True
+                    
+                    # Show success message if recently re-extracted
+                    if st.session_state.get(f"reextracted_{field}", False):
+                        st.success(f"✅ {field.replace('_', ' ').title()} was successfully re-extracted!")
+                        # Clear the re-extraction flag after showing message
+                        del st.session_state[f"reextracted_{field}"]
+                    
+                    feedback = st.text_area(
+                        "What's wrong with this extraction? Provide specific feedback:",
+                        placeholder="e.g., 'Missing secondary endpoints', 'Incorrect page numbers', 'Primary and secondary objectives are mixed up'",
+                        key=f"feedback_{prefix}_{field}",
+                        height=100
+                    )
+                    
+                    col_submit, col_cancel = st.columns([1, 1])
+                    with col_submit:
+                        if st.button("🔄 Re-extract with Feedback", key=f"reextract_{prefix}_{field}", use_container_width=True, type="primary"):
+                            if feedback and feedback.strip():
+                                # Store refinement request in session state
+                                if "refinement_requests" not in st.session_state:
+                                    st.session_state.refinement_requests = {}
+                                
+                                st.session_state.refinement_requests[field] = feedback
+                                st.info(f"Refinement requested for {title}. Re-running extraction...")
+                                
+                                # Trigger re-extraction for this specific field
+                                _reextract_field_with_feedback(field, feedback)
+                            else:
+                                st.warning("Please provide specific feedback for refinement")
+                    
+                    with col_cancel:
+                        if st.button("❌ Cancel", key=f"cancel_refine_{prefix}_{field}", use_container_width=True):
+                            # Clear the refinement UI
+                            if f"show_refine_{field}" in st.session_state:
+                                del st.session_state[f"show_refine_{field}"]
+                            st.rerun()
+                
+            else:
+                st.warning("No data extracted for this field")
+                
+                # Option to manually trigger extraction for empty fields
+                if st.button(f"🔄 Retry Extraction", key=f"retry_{prefix}_{field}"):
+                    st.info(f"Retrying extraction for {title}...")
+                    _reextract_field_with_feedback(field, "Field was empty, please try to extract again with more focus")
+
+
+def _reextract_field_with_feedback(field_name: str, feedback: str):
+    """Re-extract a specific field with user feedback"""
+    if not st.session_state.get("current_state"):
+        st.error("No active extraction to refine")
+        return
+    
+    try:
+        from langgraph_custom.multi_turn_extractor import MultiTurnExtractor
+        from langgraph_custom.enhanced_parser import EnhancedClinicalTrialParser
+        
+        # Get the current state
+        state = st.session_state.current_state
+        
+        # Get full text - check cache first, then state, then try to re-extract
+        full_text = None
+        
+        # Priority 1: Check session cache (most reliable)
+        if "cached_full_text" in st.session_state and st.session_state.cached_full_text:
+            full_text = st.session_state.cached_full_text
+        # Priority 2: Check state
+        elif "full_text" in state and state["full_text"]:
+            full_text = state["full_text"]
+            st.session_state.cached_full_text = full_text  # Cache it
+        # Priority 3: For URL input type, fetch from URL
+        elif state.get("input_type") == "url":
+            st.error("Cannot re-extract from URL. Full text not cached. Please start a new extraction.")
+            return
+        # Priority 4: Try to get file from database and re-extract
+        elif state.get("input_type") == "pdf":
+            # First try the original file path
+            file_path = state["input_url"]
+            
+            # If original path doesn't exist, check database for stored file
+            import os
+            if not os.path.exists(file_path):
+                file_info = get_uploaded_file_path(st.session_state.current_convo_id)
+                if file_info:
+                    file_path, original_filename = file_info
+                    st.info(f"📁 Using stored file: {original_filename}")
+                else:
+                    st.error("⚠️ PDF file no longer available and not found in database.")
+                    st.info("💡 To re-extract this field, please upload the PDF document again in a new chat session.")
+                    return
+            
+            # Check if the file exists now
+            if not os.path.exists(file_path):
+                st.error(f"⚠️ PDF file not found at: {file_path}")
+                st.info("💡 The file may have been moved or deleted. Please upload the document again.")
+                return
+            
+            # Extract and cache full text
+            parser = EnhancedClinicalTrialParser()
+            try:
+                full_text, _ = parser.extract_text_multimethod(file_path)
+                if full_text:
+                    st.session_state.cached_full_text = full_text
+                    state["full_text"] = full_text
+                else:
+                    st.error("Failed to extract text from PDF file.")
+                    return
+            except Exception as parse_error:
+                st.error(f"Error parsing PDF: {str(parse_error)}")
+                return
+        else:
+            st.error("Cannot determine input type for re-extraction.")
+            return
+        
+        if not full_text or len(full_text.strip()) < 100:
+            st.error("Insufficient text available for re-extraction. Please start a new extraction.")
+            return
+        
+        # Initialize extractor
+        extractor = MultiTurnExtractor(
+                model="gpt-4o-mini",
+                temperature=0.1,
+                max_tokens_per_call=180000,
+                delay_between_calls=2.0
+            )
+            
+        with st.spinner(f"Re-extracting {field_name.replace('_', ' ').title()} with your feedback..."):
+            # Re-extract this specific field with feedback
+            refined_result = extractor.extract_field_with_feedback(
+                full_text,
+                field_name,
+                feedback
+            )
+            
+            if refined_result:
+                # Update the state with new extraction
+                st.session_state.current_state["parsed_json"][field_name] = refined_result
+                
+                # Also update data_to_summarize
+                field_mapping = {
+                    "study_overview": "Study Overview",
+                    "brief_description": "Brief Description",
+                    "primary_secondary_objectives": "Primary and Secondary Objectives",
+                    "treatment_arms_interventions": "Treatment Arms and Interventions",
+                    "eligibility_criteria": "Eligibility Criteria",
+                    "enrollment_participant_flow": "Enrollment and Participant Flow",
+                    "adverse_events_profile": "Adverse Events Profile",
+                    "study_locations": "Study Locations",
+                    "sponsor_information": "Sponsor Information"
+                }
+                
+                display_key = field_mapping.get(field_name, field_name)
+                content = refined_result.get("content", "") if isinstance(refined_result, dict) else str(refined_result) if refined_result else ""
+                # Ensure content is a string
+                if not isinstance(content, str):
+                    content = str(content) if content else ""
+                st.session_state.current_state["data_to_summarize"][display_key] = content
+                
+                # Save updated state to database
+                save_extraction_state(st.session_state.current_convo_id, st.session_state.current_state)
+                
+                # Save re-extraction to conversation history with detailed metadata
+                reextraction_msg = f"🔄 Re-extracted {field_name.replace('_', ' ').title()} with feedback: {feedback}"
+                metadata = {
+                    "action": "re-extraction",
+                    "field": field_name,
+                    "feedback": feedback,
+                    "success": True,
+                    "extraction_method": "multi_turn_llm"
+                }
+                st.session_state.messages.append({"role": "system", "content": reextraction_msg})
+                save_message_to_db(st.session_state.current_convo_id, "system", reextraction_msg, "re-extraction", metadata)
+                
+                # Don't clear refinement UI state - let user see the success message in context
+                # Keep the tab on View JSON to show updated results
+                st.session_state.ui_state["active_extraction_tab"] = 1  # View JSON tab
+                
+                st.success(f"✅ Successfully re-extracted {field_name.replace('_', ' ').title()}!")
+                st.info("💡 The results have been updated below. You can now regenerate the summary if needed.")
+                
+                # Set flag to update UI without full state loss
+                st.session_state[f"reextracted_{field_name}"] = True
+                
+                # Use experimental_rerun to refresh display while maintaining state
+                time.sleep(0.5)  # Brief pause to show success message
+                st.rerun()
+            else:
+                st.error("Re-extraction failed. Please try again with different feedback.")
+                # Save failed re-extraction attempt
+                failure_metadata = {
+                    "action": "re-extraction",
+                    "field": field_name,
+                    "feedback": feedback,
+                    "success": False,
+                    "error": "extraction_failed"
+                }
+                save_message_to_db(st.session_state.current_convo_id, "system", 
+                                 f"❌ Re-extraction failed for {field_name.replace('_', ' ').title()}", 
+                                 "re-extraction", failure_metadata)
+        
+    except Exception as e:
+        st.error(f"Error during re-extraction: {str(e)}")
+        # Save error to conversation history
+        error_metadata = {
+            "action": "re-extraction",
+            "field": field_name,
+            "feedback": feedback,
+            "success": False,
+            "error": str(e)
+        }
+        save_message_to_db(st.session_state.current_convo_id, "system", 
+                         f"⚠️ Re-extraction error for {field_name.replace('_', ' ').title()}: {str(e)}", 
+                         "error", error_metadata)
+def _regenerate_summary(state):
+    """Regenerate summary with updated extracted data"""
+    try:
+        from langgraph_custom.langgraph_workflow import chat_node_stream
+        
+        with st.spinner("🔄 Regenerating summary with updated data..."):
+            # Update data_to_summarize with current parsed_json
+            field_mapping = {
+                "study_overview": "Study Overview",
+                "brief_description": "Brief Description",
+                "primary_secondary_objectives": "Primary and Secondary Objectives",
+                "treatment_arms_interventions": "Treatment Arms and Interventions",
+                "eligibility_criteria": "Eligibility Criteria",
+                "enrollment_participant_flow": "Enrollment and Participant Flow",
+                "adverse_events_profile": "Adverse Events Profile",
+                "study_locations": "Study Locations",
+                "sponsor_information": "Sponsor Information"
+            }
+            
+            # Rebuild data_to_summarize from current parsed_json
+            state["data_to_summarize"] = {}
+            for field, value in state.get("parsed_json", {}).items():
+                if isinstance(value, dict):
+                    content = value.get("content", "")
+                else:
+                    content = str(value) if value else ""
+                
+                # Ensure content is always a string
+                if not isinstance(content, str):
+                    content = str(content) if content else ""
+                
+                if content and content.strip():
+                    display_key = field_mapping.get(field, field)
+                    state["data_to_summarize"][display_key] = content
+            
+            # Generate new summary
+            with st.chat_message("assistant"):
+                st.markdown("### 📝 Updated Summary")
+                message_placeholder = st.empty()
+                full_response = ""
+                
+                # Stream the new summary
+                for chunk in chat_node_stream(state):
+                    full_response += chunk
+                    message_placeholder.markdown(full_response + "▌")
+                
+                message_placeholder.markdown(full_response)
+                
+                # Add PDF download button
+                col1, col2, col3 = st.columns([1, 3, 1])
+                with col1:
+                    try:
+                        pdf_data = create_summary_pdf(full_response, state.get('nct_id', 'study'))
+                        st.download_button(
+                            label="📄 Download PDF",
+                            data=pdf_data,
+                            file_name=f"summary_{state.get('nct_id', 'study')}_updated.pdf",
+                            mime="application/pdf",
+                            key="regenerated_pdf_download"
+                        )
+                    except Exception as e:
+                        st.error("PDF error")
+                st.markdown("---")
+            
+            # Save to messages and database
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
+            save_message_to_db(st.session_state.current_convo_id, "assistant", full_response)
+            
+            st.success("✅ Summary regenerated successfully!")
+            
+    except Exception as e:
+        st.error(f"Error regenerating summary: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
+
 
 def create_summary_pdf(summary_text, nct_id):
     """Create PDF from summary text"""
@@ -252,41 +881,89 @@ if "current_convo_id" not in st.session_state:
 if "current_state" not in st.session_state:
     st.session_state.current_state = None
 
+# Initialize UI state persistence
+if "ui_state" not in st.session_state:
+    st.session_state.ui_state = {
+        "active_extraction_tab": 0,
+        "expanded_fields": {},
+        "refinement_ui_open": {}
+    }
+
+# Reduce top padding
+st.markdown("""
+    <style>
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 0rem;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
 # Clean header with logo
 logo_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "ctis-2024.png")
 if os.path.exists(logo_path):
     st.markdown("""
-        <div style='display: flex; align-items: center; justify-content: center; gap: 25px; margin-bottom: 30px; padding: 30px 0; background: linear-gradient(135deg, #f5f7fa 0%, #ffffff 100%);'>
+        <div style='display: flex; align-items: center; justify-content: center; gap: 25px; margin: 0; padding: 15px 0; background: linear-gradient(135deg, #f5f7fa 0%, #ffffff 100%);'>
             <img src='data:image/png;base64,{}' width='110' style='flex-shrink: 0;'/>
             <div style='text-align: center;'>
                 <h1 style='margin: 0; padding: 0; font-size: 3.5em; font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: 700; letter-spacing: -1.5px;'>
                     <span style='color: #C1272D;'>Cli</span><span style='color: #1E293B;'>nicalI</span><span style='color: #C1272D;'>Q</span>
                 </h1>
-                <p style='color: #64748B; margin: 12px 0 0 0; padding: 0; font-size: 1.2em; font-weight: 500; font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;'>AI-Powered Clinical Protocol Intelligence Platform</p>
+                <p style='color: #64748B; margin: 8px 0 0 0; padding: 0; font-size: 1.2em; font-weight: 500; font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;'>AI-Powered Clinical Protocol Intelligence Platform</p>
             </div>
         </div>
     """.format(__import__('base64').b64encode(open(logo_path, 'rb').read()).decode()), unsafe_allow_html=True)
 else:
     st.markdown("""
-        <div style='text-align: center; margin-bottom: 30px; padding: 30px 0; background: linear-gradient(135deg, #f5f7fa 0%, #ffffff 100%);'>
+        <div style='text-align: center; margin: 0; padding: 15px 0; background: linear-gradient(135deg, #f5f7fa 0%, #ffffff 100%);'>
             <h1 style='margin: 0; padding: 0; font-size: 3.5em; font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-weight: 700; letter-spacing: -1.5px;'>
                 <span style='color: #C1272D;'>Cli</span><span style='color: #1E293B;'>nicalI</span><span style='color: #C1272D;'>Q</span>
             </h1>
-            <p style='color: #64748B; margin: 12px 0 0 0; padding: 0; font-size: 1.2em; font-weight: 500; font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;'>AI-Powered Clinical Protocol Intelligence Platform</p>
+            <p style='color: #64748B; margin: 8px 0 0 0; padding: 0; font-size: 1.2em; font-weight: 500; font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;'>AI-Powered Clinical Protocol Intelligence Platform</p>
         </div>
     """, unsafe_allow_html=True)
 
-st.markdown("---")
+st.markdown("<br>", unsafe_allow_html=True)
 
 # Sidebar
-st.sidebar.header("Past Chats")
+st.sidebar.button("➕ Start New Chat", key="new_chat_button", on_click=new_chat_click, use_container_width=True)
+
+st.sidebar.divider()
+
 # Use cached conversation list for faster sidebar rendering
 conversations = get_cached_conversations()
-for convo_id in conversations:
-    if st.sidebar.button(convo_id, key=f"conv_{convo_id}"):
-        st.session_state.messages = load_messages_from_db(convo_id)
-        st.session_state.current_convo_id = convo_id
-        # Restore state if available
+if conversations:
+    st.sidebar.subheader("💬 Past Chats")
+    
+    # Create dropdown options - show "Current" for active conversation
+    options = ["Select a conversation..."] + conversations
+    default_index = 0
+    
+    # Find current conversation in list
+    if st.session_state.current_convo_id in conversations:
+        default_index = conversations.index(st.session_state.current_convo_id) + 1
+    
+    selected_convo = st.sidebar.selectbox(
+        "Load previous conversation",
+        options=options,
+        index=default_index,
+        key="convo_selector",
+        label_visibility="collapsed"
+    )
+    
+    # Load selected conversation if changed
+    if selected_convo != "Select a conversation..." and selected_convo != st.session_state.current_convo_id:
+        st.session_state.messages = load_messages_from_db(selected_convo)
+        st.session_state.current_convo_id = selected_convo
+        
+        # Restore extraction state if available
+        saved_state = load_extraction_state(selected_convo)
+        if saved_state:
+            st.session_state.current_state = saved_state
+        else:
+            st.session_state.current_state = None
+        
+        # Restore state if available (legacy support)
         for msg in st.session_state.messages:
             if msg["role"] == "assistant" and "Clinical Trial Summary" in msg["content"]:
                 nct_match = re.search(r"NCT\d{8}", msg["content"])
@@ -295,119 +972,46 @@ for convo_id in conversations:
                 break
         st.rerun()
 
-st.sidebar.button("Start New Chat", key="new_chat_button", on_click=new_chat_click)
-
-# Show metrics in sidebar if state exists
-if st.session_state.current_state:
-    st.sidebar.divider()
-    st.sidebar.header("📊 Extraction Metrics")
-    
-    state = st.session_state.current_state
-    
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        confidence = state.get("confidence_score", 0)
-        st.metric(
-            "Confidence", 
-            f"{confidence:.1%}",
-            delta="High" if confidence > 0.7 else "Low"
-        )
-    with col2:
-        completeness = state.get("completeness_score", 0)
-        st.metric(
-            "Completeness", 
-            f"{completeness:.1%}",
-            delta="Excellent" if completeness >= 0.9 else "Good" if completeness >= 0.6 else "Incomplete"
-        )
-    
-    missing = state.get("missing_fields", [])
-    if missing:
-        st.sidebar.warning(f"**Missing {len(missing)} fields:**")
-        for field in missing[:5]:
-            st.sidebar.write(f"• {field.replace('_', ' ').title()}")
-    else:
-        st.sidebar.success("✅ All fields extracted!")
-    
-    # Download buttons section
-    st.sidebar.divider()
-    st.sidebar.subheader("📥 Downloads")
-    
-    # JSON Download
-    if state.get("parsed_json"):
-        json_str = json.dumps(state["parsed_json"], indent=2)
-        st.sidebar.download_button(
-            "📄 Download JSON Data",
-            json_str,
-            file_name=f"clinical_trial_{state.get('nct_id', 'data')}.json",
-            mime="application/json",
-            use_container_width=True
-        )
-    
-    # PDF Summary Download
-    if state.get("chat_response"):
-        try:
-            from fpdf import FPDF
-            pdf = FPDF()
-            pdf.add_page()
-            pdf.set_font("Arial", size=10)
-            
-            summary_text = state.get("chat_response", "")
-            for line in summary_text.split('\n'):
-                try:
-                    clean_line = line.encode('latin-1', 'ignore').decode('latin-1')
-                    pdf.multi_cell(0, 5, clean_line)
-                except:
-                    pass
-            
-            pdf_bytes = pdf.output(dest='S').encode('latin-1', 'ignore')
-            
-            st.sidebar.download_button(
-                "📑 Download PDF Summary",
-                pdf_bytes,
-                file_name=f"summary_{state.get('nct_id', 'report')}.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-        except Exception as e:
-            st.sidebar.error(f"PDF generation error: {str(e)[:50]}")
-    
-    # Raw data download (optional)
-    if state.get("raw_data"):
-        raw_json_str = json.dumps(state["raw_data"], indent=2)
-        st.sidebar.download_button(
-            "�️ Download Raw Data",
-            raw_json_str,
-            file_name=f"raw_data_{state.get('nct_id', 'data')}.json",
-            mime="application/json",
-            use_container_width=True
-        )
-
 # Welcome message if no messages
 if not st.session_state.messages:
     with st.chat_message("assistant"):
-        st.markdown("""
-👋 **Welcome to ClinicalIQ – AI-Powered Clinical Protocol Intelligence Platform!**
+        st.markdown("""👋 Welcome to **ClinicalIQ** - Your AI-powered clinical protocol intelligence platform!
 
-I leverage advanced AI to help you summarize and analyze clinical trial protocols. You can:
+📄 **Upload Protocols**
+Start with a clinical trial PDF or a ClinicalTrials.gov URL.
 
-- 📋 **Paste a ClinicalTrials.gov URL** (e.g., `https://clinicaltrials.gov/study/NCT03991871`)
-- 📄 **Upload a PDF protocol document** using the 📎 button below
-- 💬 **Ask intelligent questions** about the extracted data and get instant insights
+🔍 **Automated Data Extraction**
+Key fields—study overview, objectives, treatments, eligibility, and more—are extracted into structured JSON, and you can review, refine, or approve them.
 
-Let's transform your clinical protocol analysis – paste a URL or upload a file to begin!
-        """)
+📊 **Summary Generation**
+Create clear study summaries based on the extracted data.
+
+💬 **Ask Anything**
+Query your study data using natural language for fast insights.
+
+🔎 **Find Related Studies**
+Use RAG-powered search to discover similar studies or studies involving related drugs.
+
+Get started by uploading a protocol or entering a ClinicalTrials.gov URL.""")
+    st.markdown("")
 
 # Display existing chat messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        # Check if this is the extraction results marker
+        if message["content"] == "EXTRACTION_RESULTS_MARKER" and st.session_state.current_state:
+            st.markdown("### 📊 Extraction Results")
+            create_extraction_results_tabs(st.session_state.current_state)
+        else:
+            st.markdown(message["content"])
 
-# File uploader - clean minimal design
+# File uploader - clean minimal design with hidden label
 if not st.session_state.messages:
     uploaded_file = st.file_uploader(
-        "📎 Upload PDF",
+        "Upload PDF",
         type=["pdf"],
-        key="pdf_uploader"
+        key="pdf_uploader",
+        label_visibility="hidden"
     )
 else:
     uploaded_file = None
@@ -456,21 +1060,20 @@ if url_input and nct_match and not st.session_state.messages:
                 save_message_to_db(st.session_state.current_convo_id, "assistant", f"Error: {result['error']}")
             else:
                 st.session_state.current_state = result
-                st.success("✅ Data extracted successfully!")
                 
-                # Show metrics as a chat message
-                metrics_msg = create_metrics_message(result)
-                with st.chat_message("assistant"):
-                    st.markdown(metrics_msg)
-                st.session_state.messages.append({"role": "assistant", "content": metrics_msg})
-                save_message_to_db(st.session_state.current_convo_id, "assistant", metrics_msg)
+                # Cache full_text if available to prevent file access issues later
+                if "full_text" in result and result["full_text"]:
+                    st.session_state.cached_full_text = result["full_text"]
                 
-                # Show status message about what's happening next
-                status_msg = "📝 Generating comprehensive summary..."
+                # Show extraction results in tabs
                 with st.chat_message("assistant"):
-                    st.markdown(status_msg)
-                st.session_state.messages.append({"role": "assistant", "content": status_msg})
-                save_message_to_db(st.session_state.current_convo_id, "assistant", status_msg)
+                    st.markdown("### 📊 Extraction Results")
+                    create_extraction_results_tabs(result)
+                
+                # Save extraction results marker to chat history for persistence
+                st.session_state.messages.append({"role": "assistant", "content": "EXTRACTION_RESULTS_MARKER"})
+                save_message_to_db(st.session_state.current_convo_id, "assistant", "EXTRACTION_RESULTS_MARKER")
+                save_extraction_state(st.session_state.current_convo_id, result)
                 
                 # Stream the summary
                 with st.chat_message("assistant"):
@@ -483,94 +1086,28 @@ if url_input and nct_match and not st.session_state.messages:
                         message_placeholder.markdown(full_response + "▌")
                     
                     message_placeholder.markdown(full_response)
+                    
+                    # Add PDF download button right after summary
+                    col1, col2, col3 = st.columns([1, 3, 1])
+                    with col1:
+                        try:
+                            pdf_data = create_summary_pdf(full_response, result.get('nct_id', 'study'))
+                            st.download_button(
+                                label="📄 Download PDF",
+                                data=pdf_data,
+                                file_name=f"summary_{result.get('nct_id', 'study')}.pdf",
+                                mime="application/pdf",
+                                key="url_initial_pdf_download"
+                            )
+                        except Exception as e:
+                            st.error("PDF error")
+                    st.markdown("---")
                 
                 # Save to database
                 st.session_state.messages.append({"role": "assistant", "content": full_response})
                 save_message_to_db(st.session_state.current_convo_id, "assistant", full_response)
                 
-                # Show download options
-                st.markdown("---")
-                st.markdown("### 📥 Download Options")
-                
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    # PDF Download
-                    try:
-                        pdf_data = create_summary_pdf(full_response, result.get('nct_id', 'study'))
-                        st.download_button(
-                            label="📄 Summary PDF",
-                            data=pdf_data,
-                            file_name=f"clinical_trial_summary_{result.get('nct_id', 'study')}.pdf",
-                            mime="application/pdf",
-                            key="url_pdf_download"
-                        )
-                    except Exception as e:
-                        st.error("PDF gen error")
-                
-                with col2:
-                    # Text Download
-                    text_summary = f"Clinical Trial Summary: {result.get('nct_id', 'Unknown')}\n\n{full_response}"
-                    st.download_button(
-                        label="📝 Summary Text",
-                        data=text_summary.encode('utf-8'),
-                        file_name=f"summary_{result.get('nct_id', 'study')}.txt",
-                        mime="text/plain",
-                            key="url_text_download"
-                    )
-                
-                with col3:
-                    # Parsed JSON - always available after extraction
-                    parsed_json = result.get("parsed_json", {})
-                    # Filter out None values for cleaner JSON
-                    filtered_json = {k: v for k, v in parsed_json.items() if v is not None} if parsed_json else {}
-                    
-                    if filtered_json:
-                        json_str = json.dumps(filtered_json, indent=2)
-                        st.download_button(
-                            label="📄 Parsed JSON",
-                            data=json_str,
-                            file_name=f"parsed_data_{result.get('nct_id', 'study')}.json",
-                            mime="application/json",
-                            key="url_parsed_json"
-                        )
-                    else:
-                        # Show empty JSON if no data extracted
-                        st.download_button(
-                            label="📄 Parsed JSON",
-                            data=json.dumps(parsed_json, indent=2),
-                            file_name=f"parsed_data_{result.get('nct_id', 'study')}.json",
-                            mime="application/json",
-                            key="url_parsed_json",
-                            help="No data extracted"
-                        )
-                
-                with col4:
-                    # Raw data - always available for URL mode
-                    raw_data = result.get("raw_data", {})
-                    
-                    if raw_data:
-                        raw_json_str = json.dumps(raw_data, indent=2)
-                        st.download_button(
-                            label="🗂️ Raw Data",
-                            data=raw_json_str,
-                            file_name=f"raw_data_{result.get('nct_id', 'study')}.json",
-                            mime="application/json",
-                            key="url_raw_data"
-                        )
-                    else:
-                        # Show empty JSON if no raw data
-                        st.download_button(
-                            label="🗂️ Raw Data",
-                            data="{}",
-                            file_name=f"raw_data_{result.get('nct_id', 'study')}.json",
-                            mime="application/json",
-                            key="url_raw_data",
-                            help="No raw data available"
-                        )
-                
                 st.balloons()
-                st.rerun()
                 
         except Exception as e:
             error_msg = f"An error occurred: {str(e)}"
@@ -580,28 +1117,49 @@ if url_input and nct_match and not st.session_state.messages:
 
 # Handle PDF upload
 if uploaded_file is not None and not st.session_state.messages:
-    st.info(f"Uploaded: **{uploaded_file.name}** ({uploaded_file.size} bytes)")
+    # Create uploads directory if it doesn't exist
+    uploads_dir = Path("uploads")
+    uploads_dir.mkdir(exist_ok=True)
     
-    # Save temporarily
-    temp_path = f"temp_{uploaded_file.name}"
-    with open(temp_path, 'wb') as f:
+    # Generate unique filename to avoid conflicts
+    import time
+    timestamp = str(int(time.time()))
+    safe_filename = f"{timestamp}_{uploaded_file.name}"
+    permanent_path = uploads_dir / safe_filename
+    
+    # Save file permanently
+    with open(permanent_path, 'wb') as f:
         f.write(uploaded_file.getvalue())
     
-    # Add user message
-    st.session_state.messages.append({"role": "user", "content": f"Uploaded PDF: {uploaded_file.name}"})
-    with st.chat_message("user"):
-        st.markdown(f"Uploaded PDF: {uploaded_file.name}")
-    save_message_to_db(st.session_state.current_convo_id, "user", f"Uploaded PDF: {uploaded_file.name}")
+    # Save file info to database
+    save_uploaded_file(
+        st.session_state.current_convo_id, 
+        uploaded_file.name, 
+        str(permanent_path), 
+        len(uploaded_file.getvalue())
+    )
+    
+    # Save upload event to conversation history
+    upload_msg = f"📄 Uploaded PDF: {uploaded_file.name} ({len(uploaded_file.getvalue())} bytes)"
+    upload_metadata = {
+        "action": "file_upload",
+        "filename": uploaded_file.name,
+        "file_size": len(uploaded_file.getvalue()),
+        "stored_path": str(permanent_path)
+    }
+    save_message_to_db(st.session_state.current_convo_id, "system", upload_msg, "file_upload", upload_metadata)
+    
+    # Add user message - show parsing status
+    with st.chat_message("assistant"):
+        st.markdown(f"🔍 Parsing uploaded PDF: **{uploaded_file.name}**")
     
     # Run workflow with progress tracking for multi-turn extraction
     try:
-        # Create progress placeholders
-        progress_container = st.empty()
-        status_text = st.empty()
-        progress_bar = st.empty()
-        progress_log_container = st.empty()  # For real-time progress messages
+        # Create a single status message that updates in place
+        status_msg = st.empty()
+        
         initial_state = {
-            "input_url": temp_path,
+            "input_url": str(permanent_path),
             "input_type": "unknown",
             "raw_data": {},
             "parsed_json": {},
@@ -622,135 +1180,61 @@ if uploaded_file is not None and not st.session_state.messages:
         }
         
         # Show initial parsing step
-        with progress_container:
-            st.info("🔍 Step 1/3: Analyzing PDF with enhanced parser...")
+        status_msg.info("🔍 Step 1/3: Analyzing PDF with enhanced parser...")
         
-        # Process through workflow - we'll need to stream the progress
-        # For now, just invoke and then display the log
-        result = st.session_state.workflow_app.invoke(initial_state)
+        # Stream workflow execution to show real-time updates
+        result = None
+        last_progress_count = 0
         
-        # Display progress log if available
-        progress_log = result.get("progress_log", [])
-        if progress_log:
-            with progress_log_container:
-                st.success("📋 Extraction Progress:")
-                for msg in progress_log:
-                    st.text(msg)
+        for chunk in st.session_state.workflow_app.stream(initial_state):
+            # Get the latest state from the chunk
+            for node_name, node_state in chunk.items():
+                if isinstance(node_state, dict):
+                    result = node_state
+                    # Check for NEW progress log updates
+                    progress_log = node_state.get("progress_log", [])
+                    if progress_log and len(progress_log) > last_progress_count:
+                        # Show only the new messages
+                        for i in range(last_progress_count, len(progress_log)):
+                            status_msg.info(f"⚙️ {progress_log[i]}")
+                        last_progress_count = len(progress_log)
         
-        # Show multi-turn extraction progress if LLM fallback was used
+        # Use the final result
+        if result is None:
+            result = st.session_state.workflow_app.invoke(initial_state)
+        
+        # Show final status with cost if LLM was used
         if result.get("used_llm_fallback"):
             cost_est = result.get("extraction_cost_estimate", {})
             if cost_est:
-                with status_text:
-                    st.info(f"💰 Cost: ${cost_est.get('total_cost', 0):.3f} | "
-                           f"⏱️ Time: {cost_est.get('estimated_time_minutes', 0):.1f} min | "
-                           f"🔢 {cost_est.get('total_tokens', 0):,} tokens")
+                status_msg.success(f"✅ Multi-turn extraction complete | Cost: ${cost_est.get('total_cost', 0):.3f} | Time: {cost_est.get('estimated_time_minutes', 0):.1f} min")
+                import time
+                time.sleep(1)
         
-        # Clear progress indicators
-        progress_container.empty()
-        # Keep progress_log_container visible to show the log
+        # Clear progress indicator
+        status_msg.empty()
         
         if result.get("error"):
             st.error(f"Error: {result['error']}")
             st.session_state.messages.append({"role": "assistant", "content": f"Error: {result['error']}"})
             save_message_to_db(st.session_state.current_convo_id, "assistant", f"Error: {result['error']}")
         else:
+            # Store result in session state
             st.session_state.current_state = result
-            st.success("✅ PDF parsed successfully!")
             
-            # Show metrics as a chat message
-            metrics_msg = create_metrics_message(result)
+            # Cache full_text if available to prevent file access issues later
+            if "full_text" in result and result["full_text"]:
+                st.session_state.cached_full_text = result["full_text"]
+            
+            # Show extraction results in tabs
             with st.chat_message("assistant"):
-                st.markdown(metrics_msg)
-            st.session_state.messages.append({"role": "assistant", "content": metrics_msg})
-            save_message_to_db(st.session_state.current_convo_id, "assistant", metrics_msg)
+                st.markdown("### 📊 Extraction Results")
+                create_extraction_results_tabs(result)
             
-            # Show extraction progress log if available
-            progress_log = result.get("progress_log", [])
-            if progress_log and len(progress_log) > 0:
-                progress_msg = "### 📋 Extraction Progress Log\n\n```\n" + "\n".join(progress_log) + "\n```"
-                with st.chat_message("assistant"):
-                    st.markdown(progress_msg)
-                st.session_state.messages.append({"role": "assistant", "content": progress_msg})
-                save_message_to_db(st.session_state.current_convo_id, "assistant", progress_msg)
-            
-            # If LLM fallback was used, show comparison tabs BEFORE summary generation
-            if result.get("used_llm_fallback"):
-                with st.chat_message("assistant"):
-                    st.markdown("### 🔍 Parser vs LLM Comparison")
-                    
-                    tab1, tab2 = st.tabs(["📄 Parser Output", "🤖 LLM Output"])
-                    
-                    with tab1:
-                        st.markdown("**Initial parser extraction (before LLM enhancement)**")
-                        parser_json = result.get("parser_only_json", {})
-                        
-                        if parser_json:
-                            # Show metrics
-                            parser_filled = sum(1 for v in parser_json.values() if v and str(v).strip() and len(str(v).strip()) > 30)
-                            st.metric("Fields Extracted by Parser", f"{parser_filled}/9")
-                            
-                            # Show field breakdown
-                            st.markdown("**Field Details:**")
-                            for field, value in parser_json.items():
-                                field_name = field.replace('_', ' ').title()
-                                if value and str(value).strip():
-                                    word_count = len(str(value).split())
-                                    st.text(f"✅ {field_name}: {word_count:,} words")
-                                else:
-                                    st.text(f"❌ {field_name}: EMPTY")
-                            
-                            # Download button
-                            parser_json_str = json.dumps(parser_json, indent=2)
-                            st.download_button(
-                                label="📥 Download Parser JSON",
-                                data=parser_json_str,
-                                file_name=f"parser_output_{result.get('nct_id', 'study')}.json",
-                                mime="application/json",
-                                key="parser_json_download_chat"
-                            )
-                        else:
-                            st.info("Parser output not available")
-                    
-                    with tab2:
-                        st.markdown("**Final LLM-enhanced extraction (multi-turn)**")
-                        llm_json = result.get("parsed_json", {})
-                        
-                        # Show metrics
-                        llm_filled = sum(1 for v in llm_json.values() if v and str(v).strip() and len(str(v).strip()) > 30)
-                        st.metric("Fields Extracted by LLM", f"{llm_filled}/9")
-                        
-                        # Show field breakdown
-                        st.markdown("**Field Details:**")
-                        for field, value in llm_json.items():
-                            field_name = field.replace('_', ' ').title()
-                            if value and str(value).strip():
-                                word_count = len(str(value).split())
-                                st.text(f"✅ {field_name}: {word_count:,} words")
-                            else:
-                                st.text(f"❌ {field_name}: EMPTY")
-                        
-                        # Download button
-                        llm_json_str = json.dumps(llm_json, indent=2)
-                        st.download_button(
-                            label="📥 Download LLM JSON",
-                            data=llm_json_str,
-                            file_name=f"llm_output_{result.get('nct_id', 'study')}.json",
-                            mime="application/json",
-                            key="llm_json_download_chat"
-                        )
-                
-                # Save tabs info as a message
-                tabs_msg = "✅ Parser vs LLM comparison tabs shown above"
-                st.session_state.messages.append({"role": "assistant", "content": tabs_msg})
-                save_message_to_db(st.session_state.current_convo_id, "assistant", tabs_msg)
-            
-            # Show status message about what's happening next
-            status_msg = "📝 Generating comprehensive summary..."
-            with st.chat_message("assistant"):
-                st.markdown(status_msg)
-            st.session_state.messages.append({"role": "assistant", "content": status_msg})
-            save_message_to_db(st.session_state.current_convo_id, "assistant", status_msg)
+            # Save extraction results message to chat history
+            st.session_state.messages.append({"role": "assistant", "content": "EXTRACTION_RESULTS_MARKER"})
+            save_message_to_db(st.session_state.current_convo_id, "assistant", "EXTRACTION_RESULTS_MARKER")
+            save_extraction_state(st.session_state.current_convo_id, result)
             
             # Stream the summary
             with st.chat_message("assistant"):
@@ -762,85 +1246,36 @@ if uploaded_file is not None and not st.session_state.messages:
                     message_placeholder.markdown(full_response + "▌")
                 
                 message_placeholder.markdown(full_response)
+                
+                # Add PDF download button right after summary
+                col1, col2, col3 = st.columns([1, 3, 1])
+                with col1:
+                    try:
+                        pdf_data = create_summary_pdf(full_response, result.get('nct_id', 'study'))
+                        st.download_button(
+                            label="📄 Download PDF",
+                            data=pdf_data,
+                            file_name=f"summary_{result.get('nct_id', 'study')}.pdf",
+                            mime="application/pdf",
+                            key="pdf_chat_pdf_download"
+                        )
+                    except Exception as e:
+                        st.error("PDF error")
+                st.markdown("---")
             
             st.session_state.messages.append({"role": "assistant", "content": full_response})
             save_message_to_db(st.session_state.current_convo_id, "assistant", full_response)
             
-            # Show download options
-            st.markdown("---")
-            st.markdown("### 📥 Download Options")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                # PDF Download
-                try:
-                    pdf_data = create_summary_pdf(full_response, result.get('nct_id', 'study'))
-                    st.download_button(
-                        label="📄 Summary PDF",
-                        data=pdf_data,
-                        file_name=f"clinical_trial_summary_{result.get('nct_id', 'study')}.pdf",
-                        mime="application/pdf",
-                        key="pdf_upload_pdf_download"
-                    )
-                except Exception as e:
-                    st.error("PDF gen error")
-            
-            with col2:
-                # Text Download
-                text_summary = f"Clinical Trial Summary: {result.get('nct_id', 'Unknown')}\n\n{full_response}"
-                st.download_button(
-                    label="📝 Summary Text",
-                    data=text_summary.encode('utf-8'),
-                    file_name=f"summary_{result.get('nct_id', 'study')}.txt",
-                    mime="text/plain",
-                    key="pdf_upload_text_download"
-                )
-            
-            with col3:
-                # Final JSON (after LLM if used)
-                parsed_json = result.get("parsed_json", {})
-                filtered_json = {k: v for k, v in parsed_json.items() if v is not None} if parsed_json else {}
-                
-                json_str = json.dumps(filtered_json, indent=2) if filtered_json else json.dumps(parsed_json, indent=2)
-                st.download_button(
-                    label="📄 Final JSON",
-                    data=json_str,
-                    file_name=f"final_data_{result.get('nct_id', 'study')}.json",
-                    mime="application/json",
-                    key="pdf_upload_final_json"
-                )
-            
-            with col4:
-                # Raw data
-                raw_data = result.get("raw_data", {})
-                raw_json_str = json.dumps(raw_data, indent=2) if raw_data else "{}"
-                st.download_button(
-                    label="�️ Raw Data",
-                    data=raw_json_str,
-                    file_name=f"raw_data_{result.get('nct_id', 'study')}.json",
-                    mime="application/json",
-                    key="pdf_upload_raw_data"
-                )
-            
-            # Parser vs LLM comparison tabs are shown in the chat messages above`n            # (no need to duplicate them here)`n
-            
             st.balloons()
-            st.rerun()
             
     except Exception as e:
         error_msg = f"An error occurred: {str(e)}"
         st.error(error_msg)
         st.session_state.messages.append({"role": "assistant", "content": error_msg})
         save_message_to_db(st.session_state.current_convo_id, "assistant", error_msg)
-    finally:
-        # Clean up temp file
-        import os
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
 
-# Handle chat input (URLs, questions, with file upload support)
-if prompt := st.chat_input("Ask a question or paste a ClinicalTrials.gov URL..."):
+# Handle chat input (URLs, questions, with file upload support and RAG suggestions)
+if prompt := st.chat_input("Ask a question, search similar studies, or paste a ClinicalTrials.gov URL..."):
     # Check if it's a URL
     nct_match = re.search(r'NCT\d{8}', prompt)
     is_url = nct_match is not None or 'clinicaltrials.gov' in prompt.lower()
@@ -884,14 +1319,22 @@ if prompt := st.chat_input("Ask a question or paste a ClinicalTrials.gov URL..."
                     st.session_state.messages.append({"role": "assistant", "content": f"Error: {result['error']}"})
                     save_message_to_db(st.session_state.current_convo_id, "assistant", f"Error: {result['error']}")
                 else:
+                    # Store result in session state for persistence
                     st.session_state.current_state = result
                     
-                    # Show metrics
-                    metrics_msg = create_metrics_message(result)
+                    # Cache full_text if available to prevent file access issues later
+                    if "full_text" in result and result["full_text"]:
+                        st.session_state.cached_full_text = result["full_text"]
+                    
+                    # Show extraction results in tabs
                     with st.chat_message("assistant"):
-                        st.markdown(metrics_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": metrics_msg})
-                    save_message_to_db(st.session_state.current_convo_id, "assistant", metrics_msg)
+                        st.markdown("### 📊 Extraction Results")
+                        create_extraction_results_tabs(result)
+                    
+                    # Save extraction results marker to database for persistence
+                    st.session_state.messages.append({"role": "assistant", "content": "EXTRACTION_RESULTS_MARKER"})
+                    save_message_to_db(st.session_state.current_convo_id, "assistant", "EXTRACTION_RESULTS_MARKER")
+                    save_extraction_state(st.session_state.current_convo_id, result)
                     
                     # Stream summary
                     with st.chat_message("assistant"):
@@ -906,6 +1349,24 @@ if prompt := st.chat_input("Ask a question or paste a ClinicalTrials.gov URL..."
                     
                     st.session_state.messages.append({"role": "assistant", "content": full_response})
                     save_message_to_db(st.session_state.current_convo_id, "assistant", full_response)
+                    
+                    # Add PDF download button in chat
+                    with st.chat_message("assistant"):
+                        col1, col2, col3 = st.columns([1, 3, 1])
+                        with col1:
+                            try:
+                                pdf_data = create_summary_pdf(full_response, result.get('nct_id', 'study'))
+                                st.download_button(
+                                    label="📄 Download PDF",
+                                    data=pdf_data,
+                                    file_name=f"summary_{result.get('nct_id', 'study')}.pdf",
+                                    mime="application/pdf",
+                                    key="chat_input_pdf_download"
+                                )
+                            except Exception as e:
+                                st.error("PDF error")
+                        st.markdown("---")
+                    
                     st.rerun()
                     
             except Exception as e:

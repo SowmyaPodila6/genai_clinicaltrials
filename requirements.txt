@@ -33,3 +33,9 @@ requests>=2.31.0
 fpdf>=1.7.2
 
 # Database (sqlite3 is built-in with Python)
+
+# Vector Database and Embeddings
+chromadb>=0.4.18
+sentence-transformers>=2.2.2
+langchain-community>=0.0.10
+faiss-cpu>=1.7.4

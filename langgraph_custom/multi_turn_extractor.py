@@ -25,6 +25,12 @@ import tiktoken
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from langgraph_custom.extraction_schemas import (
+    ExtractionResult,
+    FIELD_CONFIGS_WITH_SCHEMA,
+    get_extraction_result_schema_dict,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,54 +57,8 @@ class MultiTurnExtractor:
     4. Handle rate limits with automatic retries
     """
     
-    # Field definitions with extraction hints
-    FIELD_CONFIGS = {
-        "study_overview": {
-            "keywords": ["protocol", "study design", "overview", "summary", "background", "rationale"],
-            "max_tokens": 40000,
-            "priority": 1
-        },
-        "brief_description": {
-            "keywords": ["description", "purpose", "aims", "goals"],
-            "max_tokens": 30000,
-            "priority": 2
-        },
-        "primary_secondary_objectives": {
-            "keywords": ["objective", "endpoint", "primary outcome", "secondary outcome", "aim"],
-            "max_tokens": 35000,
-            "priority": 1
-        },
-        "treatment_arms_interventions": {
-            "keywords": ["treatment", "intervention", "arm", "group", "therapy", "dose", "regimen"],
-            "max_tokens": 40000,
-            "priority": 1
-        },
-        "eligibility_criteria": {
-            "keywords": ["eligibility", "inclusion", "exclusion", "criteria", "participant"],
-            "max_tokens": 35000,
-            "priority": 2
-        },
-        "enrollment_participant_flow": {
-            "keywords": ["enrollment", "randomization", "participant flow", "screening", "allocation"],
-            "max_tokens": 35000,
-            "priority": 2
-        },
-        "adverse_events_profile": {
-            "keywords": ["adverse event", "safety", "toxicity", "side effect", "AE", "SAE"],
-            "max_tokens": 50000,
-            "priority": 1
-        },
-        "study_locations": {
-            "keywords": ["site", "location", "center", "institution", "investigator"],
-            "max_tokens": 25000,
-            "priority": 3
-        },
-        "sponsor_information": {
-            "keywords": ["sponsor", "funding", "organization", "contact", "investigator"],
-            "max_tokens": 20000,
-            "priority": 3
-        }
-    }
+    # Field definitions with extraction hints (now sourced from extraction_schemas.py)
+    FIELD_CONFIGS = {field: config for field, config in FIELD_CONFIGS_WITH_SCHEMA.items()}
     
     def __init__(
         self,
@@ -107,15 +67,99 @@ class MultiTurnExtractor:
         max_tokens_per_call: int = 180000,  # Leave buffer under 200k limit
         delay_between_calls: float = 2.0  # Seconds
     ):
-        """Initialize the multi-turn extractor."""
-        self.llm = ChatOpenAI(model=model, temperature=temperature)
+        """Initialize the multi-turn extractor with structured outputs using Pydantic schemas."""
+        # Get the JSON schema from Pydantic for structured outputs
+        extraction_schema = get_extraction_result_schema_dict()
+        
+        # Initialize LLM with structured output format based on Pydantic schema
+        self.llm = ChatOpenAI(
+            model=model, 
+            temperature=temperature,
+            model_kwargs={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "clinical_trial_extraction",
+                        "description": "Structured extraction of clinical trial information with content and page references",
+                        "schema": extraction_schema,
+                        "strict": True
+                    }
+                }
+            }
+        )
         self.max_tokens_per_call = max_tokens_per_call
         self.delay_between_calls = delay_between_calls
         self.encoding = tiktoken.encoding_for_model(model)
+        self.extraction_schema = extraction_schema
         
+    def extract_page_numbers_from_text(self, text: str, content: str) -> List[int]:
+        """
+        Extract page numbers where specific content appears in the text.
+        
+        Args:
+            text: Full text with page markers
+            content: Specific content to find pages for
+            
+        Returns:
+            List of page numbers where content appears
+        """
+        import re
+        
+        pages = []
+        current_page = 1
+        
+        # Split text by page markers and track content
+        page_pattern = r'--- Page (\d+) ---'
+        text_parts = re.split(page_pattern, text)
+        
+        # Process each part
+        for i in range(0, len(text_parts)):
+            if i % 2 == 0:  # Text content
+                text_content = text_parts[i]
+                # Check if any part of the extracted content appears in this page's text
+                content_words = content.lower().split()[:10]  # Check first 10 words
+                text_lower = text_content.lower()
+                
+                matches = sum(1 for word in content_words if len(word) > 3 and word in text_lower)
+                if matches >= 3:  # If at least 3 significant words match
+                    pages.append(current_page)
+            else:  # Page number
+                try:
+                    current_page = int(text_parts[i])
+                except ValueError:
+                    continue
+        
+        return sorted(list(set(pages)))
+    
     def count_tokens(self, text: str) -> int:
         """Count tokens in text."""
         return len(self.encoding.encode(text))
+    
+    def _safe_content_to_string(self, content: Any) -> str:
+        """
+        Safely convert any content to a string.
+        
+        Args:
+            content: Content that might be string, dict, list, or other type
+            
+        Returns:
+            String representation of the content
+        """
+        if isinstance(content, str):
+            return content.strip()
+        elif isinstance(content, dict):
+            # If it's a dict, convert to formatted JSON
+            return json.dumps(content, indent=2)
+        elif isinstance(content, list):
+            # If it's a list, join items or convert to JSON
+            if all(isinstance(item, str) for item in content):
+                return "\n".join(content)
+            else:
+                return json.dumps(content, indent=2)
+        else:
+            # For any other type, convert to string
+            result = str(content) if content is not None else ""
+            return result.strip() if isinstance(result, str) else result
     
     def analyze_document_chunking(self, full_text: str) -> Dict[str, Any]:
         """
@@ -196,6 +240,12 @@ class MultiTurnExtractor:
         Returns:
             List of (start_pos, end_pos, relevance_score) tuples
         """
+        # Ensure full_text is a string
+        if isinstance(full_text, dict):
+            full_text = full_text.get('content', '') or json.dumps(full_text)
+        if not isinstance(full_text, str):
+            full_text = str(full_text) if full_text else ''
+        
         keywords = config["keywords"]
         sections = []
         
@@ -253,6 +303,12 @@ class MultiTurnExtractor:
         2. Include high-relevance sections first
         3. Add context until token limit reached
         """
+        # Ensure full_text is a string
+        if isinstance(full_text, dict):
+            full_text = full_text.get('content', '') or json.dumps(full_text)
+        if not isinstance(full_text, str):
+            full_text = str(full_text) if full_text else ''
+        
         config = self.FIELD_CONFIGS[field_name]
         
         logger.info(f"\n{'='*60}")
@@ -319,9 +375,9 @@ class MultiTurnExtractor:
         chunk_text: str,
         field_name: str,
         field_description: str
-    ) -> Optional[str]:
+    ) -> Optional[Dict[str, Any]]:
         """
-        Extract a single field using LLM.
+        Extract a single field using LLM with enhanced page references and exact text preservation.
         
         Args:
             chunk_text: Focused text chunk for this field
@@ -329,28 +385,48 @@ class MultiTurnExtractor:
             field_description: Description of what to extract
             
         Returns:
-            Extracted field value or None
+            Dictionary with 'content' and 'page_references' or None
         """
-        system_prompt = f"""You are an expert at extracting clinical trial information from PDF documents.
+        system_prompt = f"""You are an expert clinical trial document analyst extracting information from a clinical trial PDF.
 
-Extract ONLY the following field from the provided text:
-**{field_name}**: {field_description}
+You MUST extract: **{field_name}**
+What to look for: {field_description}
 
-CRITICAL INSTRUCTIONS:
-1. Extract EXACTLY what is asked for, nothing more
-2. Include ALL relevant details from the text
-3. Cite page numbers when mentioned
-4. If information is not found, return "Not found in provided text"
-5. Be comprehensive but focused on this specific field
-6. Use the exact terminology from the source document
+IMPORTANT INSTRUCTIONS:
+1. **Extract ALL relevant information** you find in the document related to this field
+2. Copy text VERBATIM - preserve exact wording, numbers, formatting, bullet points
+3. Include ALL details: numbers, percentages, timeframes, dosages, criteria, names
+4. Combine information from multiple sections if needed
+5. Look for page markers like "--- Page X ---" to identify source pages
+6. Return comprehensive content - be thorough, not minimal
 
-Return ONLY the extracted content, no explanations."""
+FOR STRUCTURED DATA:
+- Eligibility: Include BOTH inclusion AND exclusion criteria in full
+- Interventions: Include drug names, dosages, schedules, routes, duration
+- Objectives: Include PRIMARY and SECONDARY endpoints with definitions
+- Adverse Events: Include event names, frequencies, grades, percentages
 
-        user_prompt = f"""Extract **{field_name}** from this clinical trial document:
+OUTPUT REQUIREMENTS:
+- Return a JSON object with exactly two fields: "content" and "page_references"
+- "content" MUST be a single string containing all extracted information
+- "page_references" MUST be an array of integers (page numbers where info was found)
+- Extract page numbers from "--- Page X ---" markers in the text
 
+ONLY return {{"content": "Not found in provided text", "page_references": []}} if you genuinely cannot find ANY relevant information in the document.
+
+Otherwise, extract everything you can find and return it in the content field."""
+
+        user_prompt = f"""Extract **{field_name}** from the clinical trial document below.
+
+{field_description}
+
+Document text:
 {chunk_text}
 
-Return the extracted information:"""
+---
+
+Extract ALL relevant content for {field_name}. Include complete details and preserve exact wording.
+Return JSON with "content" (string with extracted info) and "page_references" (array of page numbers):"""
 
         messages = [
             SystemMessage(content=system_prompt),
@@ -359,13 +435,107 @@ Return the extracted information:"""
         
         try:
             response = self.llm.invoke(messages)
-            content = response.content.strip()
+            # Safely handle response.content which could be str, dict, list, or other types
+            raw_content = response.content
             
-            # Check if extraction failed
-            if content.lower() in ["not found", "n/a", "none", "not available", "not found in provided text"]:
-                return None
+            # Convert raw_content to string safely
+            if isinstance(raw_content, str):
+                content = raw_content.strip()
+            elif isinstance(raw_content, dict):
+                content = json.dumps(raw_content)
+            elif isinstance(raw_content, list):
+                # Handle list of content blocks (some models return this)
+                text_parts = []
+                for item in raw_content:
+                    if isinstance(item, str):
+                        text_parts.append(item)
+                    elif isinstance(item, dict):
+                        # Extract text from dict (e.g., {"type": "text", "text": "..."})
+                        if "text" in item:
+                            text_parts.append(item["text"])
+                        else:
+                            text_parts.append(json.dumps(item))
+                    else:
+                        text_parts.append(str(item))
+                content = "".join(text_parts).strip()
+            else:
+                # Fallback for any other type
+                content = str(raw_content).strip() if raw_content else ""
             
-            return content
+            # Clean up response - remove markdown formatting
+            if content.startswith("```"):
+                # Remove code block markers
+                lines = content.split("\n")
+                start_idx = 0
+                end_idx = len(lines)
+                
+                # Find start of JSON (skip ```json or just ```)
+                for i, line in enumerate(lines):
+                    if line.strip().startswith("{"):
+                        start_idx = i
+                        break
+                
+                # Find end of JSON (before closing ```)
+                for i in range(len(lines) - 1, -1, -1):
+                    if lines[i].strip().endswith("}"):
+                        end_idx = i + 1
+                        break
+                
+                content = "\n".join(lines[start_idx:end_idx])
+            
+            # Try to parse as JSON
+            try:
+                result = json.loads(content)
+                
+                # Validate structure
+                if "content" in result:
+                    extracted_content = result["content"]
+                    
+                    # Use safe conversion to string
+                    extracted_content = self._safe_content_to_string(extracted_content)
+                    
+                    # Check if extraction failed - but still return dict structure
+                    # We'll filter these later in calculate_metrics
+                    
+                    # Store the string content back in result
+                    result["content"] = extracted_content
+                    
+                    # Ensure page_references exists and is valid
+                    if "page_references" not in result:
+                        result["page_references"] = []
+                    elif not isinstance(result["page_references"], list):
+                        result["page_references"] = []
+                    
+                    # Validate page numbers are integers
+                    valid_pages = []
+                    for page in result["page_references"]:
+                        try:
+                            valid_pages.append(int(page))
+                        except (ValueError, TypeError):
+                            continue
+                    result["page_references"] = sorted(list(set(valid_pages)))  # Remove duplicates and sort
+                    
+                    # If page_references is empty, try to extract them from the chunk_text
+                    if not result["page_references"] and extracted_content and extracted_content != "Not found in provided text":
+                        detected_pages = self.extract_page_numbers_from_text(chunk_text, extracted_content)
+                        if detected_pages:
+                            result["page_references"] = detected_pages
+                            logger.info(f"📄 Detected pages from content: {detected_pages}")
+                    
+                    logger.info(f"✅ Successfully extracted {field_name} ({len(extracted_content)} chars, pages: {result['page_references']})")
+                    return result
+                    return result
+                else:
+                    # Fallback to old format
+                    return {"content": self._safe_content_to_string(content), "page_references": []}
+                    
+            except json.JSONDecodeError as json_error:
+                logger.warning(f"JSON decode error for {field_name}: {json_error}")
+                # Fallback: treat entire response as content
+                safe_content = self._safe_content_to_string(content)
+                # Always return a dict, even if content seems empty
+                # The metrics calculation will handle filtering
+                return {"content": safe_content, "page_references": []}
             
         except Exception as e:
             logger.error(f"Error extracting {field_name}: {e}")
@@ -391,15 +561,15 @@ Return the extracted information:"""
         
         # Field descriptions (same as in langgraph_workflow.py)
         field_descriptions = {
-            "study_overview": "Study title, NCT ID, phase, design type (randomized/controlled/blinded), study duration",
-            "brief_description": "2-3 sentence summary of the study purpose and design",
-            "primary_secondary_objectives": "Primary endpoints/objectives and secondary endpoints/objectives with definitions",
-            "treatment_arms_interventions": "All treatment arms, interventions, dosing schedules, and administration details",
-            "eligibility_criteria": "Inclusion criteria and exclusion criteria for participants",
-            "enrollment_participant_flow": "Target enrollment number, actual enrollment, randomization details, participant flow",
-            "adverse_events_profile": "Common adverse events with frequencies, serious adverse events, and safety data",
-            "study_locations": "Study sites, countries, and principal investigators",
-            "sponsor_information": "Primary sponsor, collaborators, and funding sources"
+            "study_overview": "Study title, NCT ID, protocol number, phase, study type (randomized/non-randomized, controlled/uncontrolled, blinded/open-label), disease/condition, and study duration",
+            "brief_description": "Concise 2-3 sentence summary of the study purpose, rationale, and overall design",
+            "primary_secondary_objectives": "PRIMARY objectives (clearly labeled) with full definitions and timeframes, followed by SECONDARY objectives (clearly labeled) with their definitions and timeframes.",
+            "treatment_arms_interventions": "All treatment arms with arm names, interventions/drugs for each arm, exact dosing schedules, routes of administration, treatment duration, and any comparator or combination therapy details",
+            "eligibility_criteria": "Complete inclusion criteria (required characteristics for enrollment) and exclusion criteria (disqualifying factors) for study participants",
+            "enrollment_participant_flow": "Target sample size, actual enrollment numbers, randomization methodology, screening process, participant allocation, and flow through study phases",
+            "adverse_events_profile": "Reported adverse events with frequencies/percentages, serious adverse events (SAEs), toxicity grades, and overall safety profile data",
+            "study_locations": "All study sites, countries, institutions, and names of principal investigators or site coordinators",
+            "sponsor_information": "Primary sponsor organization, collaborating institutions, funding sources, and contact information"
         }
         
         # Sort fields by priority
@@ -428,11 +598,13 @@ Return the extracted information:"""
                 field_descriptions[field_name]
             )
             
-            if field_value:
+            if field_value and isinstance(field_value, dict):
                 results[field_name] = field_value
-                logger.info(f"✅ Extracted {field_name}: {len(field_value)} chars")
+                content_len = len(field_value.get("content", ""))
+                pages = field_value.get("page_references", [])
+                logger.info(f"✅ Extracted {field_name}: {content_len} chars, pages: {pages}")
             else:
-                results[field_name] = ""
+                results[field_name] = {"content": "", "page_references": []}
                 logger.warning(f"⚠️  No data found for {field_name}")
             
             # Rate limit management: wait between calls
@@ -440,6 +612,212 @@ Return the extracted information:"""
                 time.sleep(self.delay_between_calls)
         
         return results
+    
+    def extract_field_with_feedback(
+        self,
+        full_text: str,
+        field_name: str,
+        feedback: str,
+        max_retries: int = 2
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Re-extract a specific field with user feedback for refinement.
+        
+        This is used when the user requests refinement of a specific field
+        after reviewing the initial extraction results.
+        
+        Args:
+            full_text: Complete PDF text
+            field_name: Name of the field to re-extract
+            feedback: User feedback on what's wrong or what to focus on
+            max_retries: Maximum retry attempts
+            
+        Returns:
+            Dictionary with 'content' and 'page_references' or None if failed
+        """
+        # Ensure full_text is a string
+        if isinstance(full_text, dict):
+            full_text = full_text.get('content', '') or json.dumps(full_text)
+        if not isinstance(full_text, str):
+            full_text = str(full_text) if full_text else ''
+        
+        if field_name not in self.FIELD_CONFIGS:
+            logger.error(f"Unknown field: {field_name}")
+            return None
+        
+        # Field descriptions
+        field_descriptions = {
+            "study_overview": "Study title, NCT ID, protocol number, phase, study type (randomized/non-randomized, controlled/uncontrolled, blinded/open-label), disease/condition, and study duration",
+            "brief_description": "Concise 2-3 sentence summary of the study purpose, rationale, and overall design",
+            "primary_secondary_objectives": "PRIMARY objectives (clearly labeled) with full definitions and timeframes, followed by SECONDARY objectives (clearly labeled) with their definitions and timeframes.",
+            "treatment_arms_interventions": "All treatment arms with arm names, interventions/drugs for each arm, exact dosing schedules, routes of administration, treatment duration, and any comparator or combination therapy details",
+            "eligibility_criteria": "Complete inclusion criteria (required characteristics for enrollment) and exclusion criteria (disqualifying factors) for study participants",
+            "enrollment_participant_flow": "Target sample size, actual enrollment numbers, randomization methodology, screening process, participant allocation, and flow through study phases",
+            "adverse_events_profile": "Reported adverse events with frequencies/percentages, serious adverse events (SAEs), toxicity grades, and overall safety profile data",
+            "study_locations": "All study sites, countries, institutions, and names of principal investigators or site coordinators",
+            "sponsor_information": "Primary sponsor organization, collaborating institutions, funding sources, and contact information"
+        }
+        
+        config = self.FIELD_CONFIGS[field_name]
+        
+        for attempt in range(max_retries):
+            try:
+                # Create focused chunk for this field
+                chunk_text = self.create_field_chunk(
+                    full_text,
+                    field_name,
+                    config["max_tokens"]
+                )
+                
+                # Enhanced extraction with feedback
+                system_prompt = f"""You are an expert at extracting clinical trial information from PDF documents.
+
+A user has requested refinement of the **{field_name}** field with this feedback:
+"{feedback}"
+
+Extract the following field from the provided text, paying special attention to the user's feedback:
+**{field_name}**: {field_descriptions[field_name]}
+
+USER FEEDBACK TO ADDRESS: {feedback}
+
+CRITICAL INSTRUCTIONS:
+1. Extract EXACTLY what is asked for - be precise and comprehensive
+2. Address the user's feedback directly - fix any issues they mentioned
+3. Include ALL relevant details from the text that match this field
+4. Look for page markers in the format "--- Page X ---" to identify page numbers
+5. List ALL page numbers where this information appears
+6. If information is not found, return "Not found in provided text"
+7. Use the exact terminology and structure from the source document
+8. Include specific metrics, time frames, and definitions when present
+
+CRITICAL JSON OUTPUT REQUIREMENTS:
+- You MUST return ONLY a valid JSON object
+- The "content" field MUST be a STRING (never a dict or list)
+- Do NOT return markdown code blocks or any text outside the JSON
+- Do NOT wrap the JSON in backticks or code markers
+- Return ONLY the raw JSON object
+
+Return your response in this EXACT JSON format:
+{{"content": "The extracted information here (preserve all details, bullet points, and structure)", "page_references": [1, 2, 3]}}
+
+IMPORTANT for page_references:
+- Scan the text for markers like "--- Page 5 ---" 
+- Extract the page number from each marker where relevant content appears
+- Return page numbers as a list of integers
+- If no page markers found, return empty list []"""
+
+                user_prompt = f"""Extract **{field_name}** from this clinical trial document, addressing the user feedback:
+
+{chunk_text}
+
+Return the extracted information in JSON format with content and page_references:Ensure the content field is always a string, not dict."""
+
+                messages = [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt)
+                ]
+                
+                response = self.llm.invoke(messages)
+                # Safely handle response.content which could be str, dict, list, or other types
+                raw_content = response.content
+                
+                # Convert raw_content to string safely
+                if isinstance(raw_content, str):
+                    content = raw_content.strip()
+                elif isinstance(raw_content, dict):
+                    content = json.dumps(raw_content)
+                elif isinstance(raw_content, list):
+                    # Handle list of content blocks (some models return this)
+                    text_parts = []
+                    for item in raw_content:
+                        if isinstance(item, str):
+                            text_parts.append(item)
+                        elif isinstance(item, dict):
+                            # Extract text from dict (e.g., {"type": "text", "text": "..."})
+                            if "text" in item:
+                                text_parts.append(item["text"])
+                            else:
+                                text_parts.append(json.dumps(item))
+                        else:
+                            text_parts.append(str(item))
+                    content = "".join(text_parts).strip()
+                else:
+                    # Fallback for any other type
+                    content = str(raw_content).strip() if raw_content else ""
+                
+                # Try to parse as JSON
+                try:
+                    # Remove markdown code blocks if present
+                    if content.startswith("```"):
+                        content = content.split("```")[1]
+                        if content.startswith("json"):
+                            content = content[4:]
+                        content = content.strip()
+                    
+                    result = json.loads(content)
+                    
+                    # Validate structure
+                    if "content" in result:
+                        extracted_content = result["content"]
+                        
+                        # Use safe conversion to string
+                        extracted_content = self._safe_content_to_string(extracted_content)
+                        
+                        # Check if extraction failed
+                        if extracted_content.lower() in ["not found in provided text"]:
+                            logger.warning(f"No content found for {field_name} with feedback")
+                            if attempt < max_retries - 1:
+                                continue
+                            # Return empty result instead of None
+                            return {"content": "", "page_references": []}
+                        
+                        # Store the string content back in result
+                        result["content"] = extracted_content
+                        
+                        # Ensure page_references exists and is valid
+                        if "page_references" not in result:
+                            result["page_references"] = []
+                        elif not isinstance(result["page_references"], list):
+                            result["page_references"] = []
+                        
+                        # Validate page numbers are integers
+                        valid_pages = []
+                        for page in result["page_references"]:
+                            try:
+                                valid_pages.append(int(page))
+                            except (ValueError, TypeError):
+                                continue
+                        result["page_references"] = sorted(list(set(valid_pages)))  # Remove duplicates and sort
+                        
+                        logger.info(f"✅ Successfully re-extracted {field_name} with feedback")
+                        return result
+                    else:
+                        # Fallback to old format
+                        safe_content = self._safe_content_to_string(content)
+                        # Always return content, even if seems empty
+                        return {"content": safe_content, "page_references": []}
+                        
+                except json.JSONDecodeError as json_error:
+                    logger.warning(f"JSON decode error for {field_name} with feedback: {json_error}")
+                    # Fallback: treat entire response as content
+                    safe_content = self._safe_content_to_string(content)
+                    # Always return content, let metrics decide if it's valid
+                    return {"content": safe_content, "page_references": []}
+                
+            except Exception as e:
+                logger.error(f"Error re-extracting {field_name} with feedback (attempt {attempt + 1}): {e}")
+                
+                if attempt < max_retries - 1:
+                    # Wait before retry
+                    wait_time = self.delay_between_calls * (2 ** attempt)
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"❌ Failed to re-extract {field_name} after {max_retries} attempts")
+                    # Return empty result instead of None
+                    return {"content": "", "page_references": []}
+        
+        # Return empty result if we get here
+        return {"content": "", "page_references": []}
     
     def extract_with_retry(
         self,
@@ -458,6 +836,12 @@ Return the extracted information:"""
         Returns:
             Dictionary of extracted fields
         """
+        # Ensure full_text is a string at the entry point
+        if isinstance(full_text, dict):
+            full_text = full_text.get('content', '') or json.dumps(full_text)
+        if not isinstance(full_text, str):
+            full_text = str(full_text) if full_text else ''
+        
         results = {}
         
         for field_name in self.FIELD_CONFIGS.keys():
@@ -479,15 +863,15 @@ Return the extracted information:"""
                     )
                     
                     field_descriptions = {
-                        "study_overview": "Study title, NCT ID, phase, design type (randomized/controlled/blinded), study duration",
-                        "brief_description": "2-3 sentence summary of the study purpose and design",
-                        "primary_secondary_objectives": "Primary endpoints/objectives and secondary endpoints/objectives with definitions",
-                        "treatment_arms_interventions": "All treatment arms, interventions, dosing schedules, and administration details",
-                        "eligibility_criteria": "Inclusion criteria and exclusion criteria for participants",
-                        "enrollment_participant_flow": "Target enrollment number, actual enrollment, randomization details, participant flow",
-                        "adverse_events_profile": "Common adverse events with frequencies, serious adverse events, and safety data",
-                        "study_locations": "Study sites, countries, and principal investigators",
-                        "sponsor_information": "Primary sponsor, collaborators, and funding sources"
+                        "study_overview": "Study title, NCT ID, protocol number, phase, study type (randomized/non-randomized, controlled/uncontrolled, blinded/open-label), disease/condition, and study duration",
+                        "brief_description": "Concise 2-3 sentence summary of the study purpose, rationale, and overall design",
+                        "primary_secondary_objectives": "PRIMARY objectives (clearly labeled) with full definitions and timeframes, followed by SECONDARY objectives (clearly labeled) with their definitions and timeframes.",
+                        "treatment_arms_interventions": "All treatment arms with arm names, interventions/drugs for each arm, exact dosing schedules, routes of administration, treatment duration, and any comparator or combination therapy details",
+                        "eligibility_criteria": "Complete inclusion criteria (required characteristics for enrollment) and exclusion criteria (disqualifying factors) for study participants",
+                        "enrollment_participant_flow": "Target sample size, actual enrollment numbers, randomization methodology, screening process, participant allocation, and flow through study phases",
+                        "adverse_events_profile": "Reported adverse events with frequencies/percentages, serious adverse events (SAEs), toxicity grades, and overall safety profile data",
+                        "study_locations": "All study sites, countries, institutions, and names of principal investigators or site coordinators",
+                        "sponsor_information": "Primary sponsor organization, collaborating institutions, funding sources, and contact information"
                     }
                     
                     field_value = self.extract_field(
@@ -496,8 +880,16 @@ Return the extracted information:"""
                         field_descriptions[field_name]
                     )
                     
-                    results[field_name] = field_value if field_value else ""
-                    logger.info(f"✅ Extracted {field_name} (attempt {attempt + 1})")
+                    # Store result with debug info
+                    if field_value and isinstance(field_value, dict):
+                        content = field_value.get("content", "")
+                        pages = field_value.get("page_references", [])
+                        word_count = len(content.split()) if content else 0
+                        logger.info(f"✅ {field_name}: {word_count} words, pages {pages}")
+                        results[field_name] = field_value
+                    else:
+                        logger.warning(f"⚠️  {field_name}: No result from extraction")
+                        results[field_name] = {"content": "", "page_references": []}
                     break  # Success, move to next field
                     
                 except Exception as e:
@@ -510,7 +902,7 @@ Return the extracted information:"""
                         time.sleep(wait_time)
                     else:
                         # All retries failed
-                        results[field_name] = ""
+                        results[field_name] = {"content": "", "page_references": []}
                         logger.error(f"❌ Failed to extract {field_name} after {max_retries} attempts")
             
             # Small delay between fields
