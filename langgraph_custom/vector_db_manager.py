@@ -325,6 +325,29 @@ class ClinicalTrialsVectorDB:
             logger.error(f"Error searching vector database: {e}")
             return []
     
+    def search_by_query(
+        self,
+        query: str,
+        n_results: int = 10,
+        conditions: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for clinical trials by general query
+        
+        Args:
+            query: General search query (drug names, conditions, treatments, etc.)
+            n_results: Number of results to return
+            conditions: Optional list of conditions to filter by
+            
+        Returns:
+            List of similar studies
+        """
+        filters = {}
+        if conditions:
+            filters["conditions"] = " ".join(conditions).lower()
+        
+        return self.search_similar_studies(query, n_results, filters)
+    
     def search_by_drug(
         self,
         drug_name: str,

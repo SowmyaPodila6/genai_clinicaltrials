@@ -990,7 +990,7 @@ Create clear study summaries based on the extracted data.
 Query your study data using natural language for fast insights.
 
 🔎 **Find Related Studies**
-Use RAG-powered search to discover similar studies or studies involving related drugs.
+Search for clinical trials that use a specific drug or intervention, or find studies similar to an uploaded study/trial.
 
 Get started by uploading a protocol or entering a ClinicalTrials.gov URL.""")
     st.markdown("")
@@ -1275,7 +1275,7 @@ if uploaded_file is not None and not st.session_state.messages:
         save_message_to_db(st.session_state.current_convo_id, "assistant", error_msg)
 
 # Handle chat input (URLs, questions, with file upload support and RAG suggestions)
-if prompt := st.chat_input("Ask a question, search similar studies, or paste a ClinicalTrials.gov URL..."):
+if prompt := st.chat_input("Ask a question, search for clinical trials (e.g., 'Find studies using Nivolumab'), or paste a ClinicalTrials.gov URL..."):
     # Check if it's a URL
     nct_match = re.search(r'NCT\d{8}', prompt)
     is_url = nct_match is not None or 'clinicaltrials.gov' in prompt.lower()
@@ -1383,6 +1383,9 @@ if prompt := st.chat_input("Ask a question, search similar studies, or paste a C
         
         # Generate response with streaming
         with st.chat_message("assistant"):
+            # Check if this might be a RAG query (even without existing state)
+            from langgraph_custom.langgraph_workflow import should_use_rag_tool
+            
             if st.session_state.current_state:
                 # Update state with new query
                 chat_state = st.session_state.current_state.copy()
@@ -1408,8 +1411,61 @@ if prompt := st.chat_input("Ask a question, search similar studies, or paste a C
                     st.error(error_msg)
                     st.session_state.messages.append({"role": "assistant", "content": error_msg})
                     save_message_to_db(st.session_state.current_convo_id, "assistant", error_msg)
+            elif should_use_rag_tool(prompt):
+                # Handle RAG-only queries without requiring document processing
+                try:
+                    # Create a minimal state for RAG-only processing
+                    rag_state = {
+                        "input_url": "",
+                        "input_type": "rag_only",
+                        "raw_data": {},
+                        "parsed_json": {},
+                        "data_to_summarize": {},
+                        "confidence_score": 0.0,
+                        "completeness_score": 0.0,
+                        "missing_fields": [],
+                        "nct_id": "",
+                        "chat_query": prompt,
+                        "chat_response": "",
+                        "stream_response": None,
+                        "error": "",
+                        "used_llm_fallback": False,
+                        "extraction_progress": {},
+                        "extraction_cost_estimate": {},
+                        "progress_log": [],
+                        "use_rag_tool": False,
+                        "rag_tool_results": ""
+                    }
+                    
+                    # Process through workflow for RAG search
+                    result = st.session_state.workflow_app.invoke(rag_state)
+                    
+                    if result.get("error"):
+                        st.error(f"Error: {result['error']}")
+                        st.session_state.messages.append({"role": "assistant", "content": f"Error: {result['error']}"})
+                        save_message_to_db(st.session_state.current_convo_id, "assistant", f"Error: {result['error']}")
+                    else:
+                        # Stream the RAG response
+                        message_placeholder = st.empty()
+                        full_response = ""
+                        
+                        for chunk in chat_node_stream(result):
+                            full_response += chunk
+                            message_placeholder.markdown(full_response + "▌")
+                        
+                        message_placeholder.markdown(full_response)
+                        
+                        # Save to session and database
+                        st.session_state.messages.append({"role": "assistant", "content": full_response})
+                        save_message_to_db(st.session_state.current_convo_id, "assistant", full_response)
+                        
+                except Exception as e:
+                    error_msg = f"Error processing RAG query: {str(e)}"
+                    st.error(error_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                    save_message_to_db(st.session_state.current_convo_id, "assistant", error_msg)
             else:
-                no_data_msg = "Please process a document first before asking questions."
-                st.warning(no_data_msg)
+                no_data_msg = "Please process a document first before asking questions, or try searching for clinical trials (e.g., 'Find studies that use Nivolumab')."
+                st.info(no_data_msg)
                 st.session_state.messages.append({"role": "assistant", "content": no_data_msg})
                 save_message_to_db(st.session_state.current_convo_id, "assistant", no_data_msg)

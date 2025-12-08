@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 class ClinicalTrialSearchInput(BaseModel):
     """Input schema for clinical trial search tool"""
-    drug_name: str = Field(
-        description="Name of the drug, medication, or intervention to search for"
+    search_query: str = Field(
+        description="Search query for finding similar clinical trials - can include drug names, conditions, treatment types, or any combination"
     )
     n_results: int = Field(
         default=5,
@@ -28,7 +28,7 @@ class ClinicalTrialSearchInput(BaseModel):
     )
     conditions: Optional[List[str]] = Field(
         default=None,
-        description="Optional list of cancer conditions to filter by (e.g., ['lung cancer', 'breast cancer'])"
+        description="Optional list of medical conditions to filter by (e.g., ['lung cancer', 'breast cancer', 'HIV'])"
     )
 
 
@@ -38,15 +38,22 @@ class ClinicalTrialSearchTool(BaseTool):
     """
     name: str = "search_similar_clinical_trials"
     description: str = """
-    Search for similar cancer clinical trials based on a drug or intervention name.
-    This tool finds clinical trials that use similar drugs or treatments and returns
+    Search for similar clinical trials based on a flexible search query.
+    This tool finds clinical trials that match the search criteria and returns
     relevant studies with their NCT IDs, titles, and ClinicalTrials.gov URLs.
     
     Use this tool when users ask about:
-    - Similar studies using a specific drug
-    - Other trials for a medication
+    - Similar studies using specific drugs or drug combinations
+    - Other trials for particular conditions or treatments
     - Comparable treatments or interventions
-    - Related clinical research
+    - Related clinical research across different therapeutic areas
+    
+    The tool accepts flexible search queries including:
+    - Drug names (brand names, generic names, abbreviations)
+    - Drug combinations (e.g., "DTG + TAF + FTC")
+    - Treatment modalities (e.g., "immunotherapy", "chemotherapy")
+    - Medical conditions (e.g., "HIV", "lung cancer")
+    - Any combination of the above
     
     The tool returns structured information about each study including:
     - NCT ID and official study URL
@@ -76,40 +83,48 @@ class ClinicalTrialSearchTool(BaseTool):
     
     def _run(
         self,
-        drug_name: str,
+        search_query: str,
         n_results: int = 5,
         conditions: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForToolRun] = None,
     ) -> str:
         """
-        Search for similar clinical trials
+        Search for similar clinical trials using flexible search query
         """
         if not self.vector_db:
             return "Error: Clinical trials database not available. Please ensure the vector database is properly initialized."
         
         try:
             # Validate inputs
-            if not drug_name or not drug_name.strip():
-                return "Error: Please provide a valid drug or intervention name."
+            if not search_query or not search_query.strip():
+                return "Error: Please provide a valid search query."
             
-            drug_name = drug_name.strip()
+            search_query = search_query.strip()
             n_results = max(1, min(n_results, 20))  # Clamp between 1 and 20
             
-            logger.info(f"Searching for clinical trials similar to drug: {drug_name}")
+            logger.info(f"Searching for clinical trials with query: {search_query}")
             
-            # Search using vector database
-            results = self.vector_db.search_by_drug(
-                drug_name=drug_name,
-                n_results=n_results,
-                conditions=conditions
-            )
+            # Try to use search_by_query if available, fallback to search_by_drug for compatibility
+            if hasattr(self.vector_db, 'search_by_query'):
+                results = self.vector_db.search_by_query(
+                    query=search_query,
+                    n_results=n_results,
+                    conditions=conditions
+                )
+            else:
+                # Fallback to existing search_by_drug method
+                results = self.vector_db.search_by_drug(
+                    drug_name=search_query,
+                    n_results=n_results,
+                    conditions=conditions
+                )
             
             if not results:
-                return f"No similar clinical trials found for '{drug_name}'. The database may not contain studies with this intervention, or it may be spelled differently."
+                return f"No similar clinical trials found for '{search_query}'. The database may not contain studies matching this search criteria."
             
             # Format results for LangGraph response
             response_parts = [
-                f"Found {len(results)} similar clinical trials for '{drug_name}':\\n"
+                f"Found {len(results)} similar clinical trials for '{search_query}':\\n"
             ]
             
             for i, study in enumerate(results, 1):
@@ -127,11 +142,11 @@ class ClinicalTrialSearchTool(BaseTool):
                 
                 study_info = [
                     f"{i}. **{nct_id}** - {title}",
-                    f"   📊 Similarity: {similarity:.2%}",
-                    f"   🔬 Status: {status}",
-                    f"   🧪 Phase: {phases}" if phases != 'Unknown' else "",
-                    f"   💊 Interventions: {interventions}" if len(interventions) < 100 else f"   💊 Interventions: {interventions[:97]}...",
-                    f"   🔗 Study URL: {study_url}",
+                    f"   Similarity: {similarity:.2%}",
+                    f"   Status: {status}",
+                    f"   Phase: {phases}" if phases != 'Unknown' else "",
+                    f"   Interventions: {interventions}" if len(interventions) < 100 else f"   Interventions: {interventions[:97]}...",
+                    f"   Study URL: {study_url}",
                     ""
                 ]
                 
@@ -139,11 +154,11 @@ class ClinicalTrialSearchTool(BaseTool):
             
             # Add summary information
             if conditions:
-                response_parts.append(f"ℹ️  Search was filtered for conditions: {', '.join(conditions)}")
+                response_parts.append(f"Search was filtered for conditions: {', '.join(conditions)}")
             
             response_parts.extend([
                 "",
-                "💡 **How to use this information:**",
+                "**How to use this information:**",
                 "- Click on the Study URL links to view full details on ClinicalTrials.gov",
                 "- Higher similarity scores indicate more relevant studies",
                 "- Check the study status to see if trials are currently recruiting",
@@ -159,13 +174,13 @@ class ClinicalTrialSearchTool(BaseTool):
     
     async def _arun(
         self,
-        drug_name: str,
+        search_query: str,
         n_results: int = 5,
         conditions: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForToolRun] = None,
     ) -> str:
         """Async version of the tool"""
-        return self._run(drug_name, n_results, conditions, run_manager)
+        return self._run(search_query, n_results, conditions, run_manager)
 
 
 def create_clinical_trials_rag_tool(db_path: str = "db/clinical_trials_vectordb") -> ClinicalTrialSearchTool:

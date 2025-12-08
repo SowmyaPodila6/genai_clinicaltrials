@@ -26,19 +26,19 @@ try:
     MULTI_TURN_AVAILABLE = True
 except ImportError:
     MULTI_TURN_AVAILABLE = False
-    print("⚠️  multi_turn_extractor not available - falling back to single-call extraction")
+    print("WARNING: multi_turn_extractor not available - falling back to single-call extraction")
 
 # Import RAG tool for clinical trials search
 try:
-    from .rag_tool import create_clinical_trials_rag_tool
+    from .rag_tool import create_clinical_trials_rag_tool, ClinicalTrialSearchTool
     RAG_TOOL_AVAILABLE = True
-    print("✅ RAG tool loaded successfully")
+    print("RAG tool loaded successfully")
 except ImportError as e:
     RAG_TOOL_AVAILABLE = False
-    print(f"⚠️  RAG tool not available - clinical trials similarity search disabled: {e}")
+    print(f"WARNING: RAG tool not available - clinical trials similarity search disabled: {e}")
 except Exception as e:
     RAG_TOOL_AVAILABLE = False
-    print(f"❌ RAG tool failed to load: {e}")
+    print(f"ERROR: RAG tool failed to load: {e}")
 
 load_dotenv()
 
@@ -83,8 +83,37 @@ class WorkflowState(TypedDict):
 
 
 def classify_input(state: WorkflowState) -> WorkflowState:
-    """Node: Classify input as PDF or URL (same logic as app_v1)"""
+    """Node: Classify input as PDF, URL, or RAG-only query"""
     input_url = state["input_url"]
+    chat_query = state.get("chat_query", "")
+    
+    # If input_type is already set (e.g., by UI), respect it
+    if state.get("input_type") == "rag_only":
+        # Ensure empty data structures for RAG-only queries
+        state["data_to_summarize"] = {}
+        state["parsed_json"] = {}
+        state["raw_data"] = {}
+        return state
+    
+    # Check if this is a RAG-only query (no URL provided but has chat query)
+    if (not input_url or input_url.strip() == "") and chat_query and should_use_rag_tool(chat_query):
+        state["input_type"] = "rag_only"
+        # Set empty data structures for RAG-only queries
+        state["data_to_summarize"] = {}
+        state["parsed_json"] = {}
+        state["raw_data"] = {}
+        return state
+    
+    # Handle cases with existing parsed data (follow-up questions)
+    if (not input_url or input_url.strip() == "") and state.get("parsed_json") and chat_query:
+        state["input_type"] = "followup"
+        return state
+    
+    # Original URL/PDF classification logic
+    if not input_url or input_url.strip() == "":
+        state["input_type"] = "unknown"
+        state["error"] = "Please provide a ClinicalTrials.gov URL, PDF file, or ask a question about clinical trials."
+        return state
     
     if input_url.lower().endswith('.pdf') or 'pdf' in input_url.lower():
         state["input_type"] = "pdf"
@@ -97,12 +126,14 @@ def classify_input(state: WorkflowState) -> WorkflowState:
     return state
 
 
-def route_input(state: WorkflowState) -> Literal["pdf_parser", "url_extractor", "error"]:
+def route_input(state: WorkflowState) -> Literal["pdf_parser", "url_extractor", "route_decision", "error"]:
     """Conditional edge: Route based on input type"""
     if state["input_type"] == "pdf":
         return "pdf_parser"
     elif state["input_type"] == "url":
         return "url_extractor"
+    elif state["input_type"] == "rag_only" or state["input_type"] == "followup":
+        return "route_decision"  # Skip study processing, go directly to chat/RAG routing
     else:
         return "error"
 
@@ -837,7 +868,7 @@ def extract_from_url(state: WorkflowState) -> WorkflowState:
 
 
 def should_use_rag_tool(query: str) -> bool:
-    """Determine if a query should use the RAG tool for clinical trials search"""
+    """Use LLM to determine if a query should use the RAG tool for clinical trials search"""
     if not query or not RAG_TOOL_AVAILABLE:
         return False
     
@@ -847,91 +878,107 @@ def should_use_rag_tool(query: str) -> bool:
     elif not isinstance(query, str):
         query = str(query)
     
-    query_lower = query.lower()
-    
-    # Keywords that indicate a drug/treatment similarity search
-    rag_keywords = [
-        'similar studies', 'similar trials', 'other studies', 'other trials',
-        'comparable', 'related studies', 'related trials', 'find studies',
-        'search studies', 'trials using', 'studies using', 'studies with',
-        'trials with', 'similar drugs', 'other drugs', 'alternative treatments',
-        'comparable drugs', 'related treatments', 'what other', 'are there other',
-        'show me studies', 'find trials', 'search trials', 'clinical trials using'
-    ]
-    
-    # Drug-related terms that might indicate searching for similar treatments
-    drug_terms = [
-        'drug', 'medication', 'treatment', 'therapy', 'intervention',
-        'pembrolizumab', 'nivolumab', 'atezolizumab', 'durvalumab',
-        'immunotherapy', 'checkpoint inhibitor', 'monoclonal antibody',
-        'chemotherapy', 'targeted therapy', 'anti-pd1', 'anti-pdl1'
-    ]
-    
-    # Check for RAG keywords
-    has_rag_keyword = any(keyword in query_lower for keyword in rag_keywords)
-    
-    # Check for drug terms
-    has_drug_term = any(term in query_lower for term in drug_terms)
-    
-    # Use RAG if we have both similarity intent and drug-related terms
-    return has_rag_keyword and has_drug_term
+    # Use LLM to determine if this query needs RAG search
+    try:
+        detection_prompt = f"""You are an AI assistant that determines if a user query requires searching a clinical trials database.
+
+User query: "{query}"
+
+Analyze this query and determine if it:
+1. Asks for similar studies, trials, or research
+2. Requests information about other treatments, drugs, or interventions
+3. Seeks comparative information about clinical trials
+4. Asks about alternative therapies or medications
+5. Requests finding or searching for clinical trials
+
+Respond with only "YES" if the query requires database search, or "NO" if it doesn't.
+
+Examples:
+- "Can you fetch similar studies using DTG + TAF + FTC?" → YES
+- "What other trials use pembrolizumab?" → YES
+- "Find studies with similar drugs" → YES
+- "What is the primary endpoint of this study?" → NO
+- "Generate summary" → NO"""
+        
+        detection_response = llm.invoke([HumanMessage(content=detection_prompt)])
+        result = detection_response.content.strip().upper()
+        
+        return result == "YES"
+        
+    except Exception as e:
+        print(f"WARNING: LLM detection error: {e}")
+        # Fallback to simple keyword detection
+        query_lower = query.lower()
+        simple_keywords = ['similar', 'other', 'find', 'search', 'fetch', 'show', 'list', 'compare']
+        return any(keyword in query_lower for keyword in simple_keywords)
 
 
-def extract_drug_name_from_query(query: str) -> str:
-    """Extract drug name from user query"""
-    import re
+def generate_rag_search_query(user_query: str, current_study_data: dict = None) -> str:
+    """Use LLM to generate an appropriate search query for the RAG tool based on user intent"""
     
     # Ensure query is a string
-    if isinstance(query, dict):
-        query = str(query)
-    elif not isinstance(query, str):
-        query = str(query)
+    if isinstance(user_query, dict):
+        user_query = str(user_query)
+    elif not isinstance(user_query, str):
+        user_query = str(user_query)
     
-    query_lower = query.lower()
-    
-    # Common drug name patterns
-    known_drugs = [
-        'pembrolizumab', 'nivolumab', 'atezolizumab', 'durvalumab',
-        'ipilimumab', 'avelumab', 'cemiplimab', 'dostarlimab',
-        'bevacizumab', 'trastuzumab', 'rituximab', 'cetuximab',
-        'panitumumab', 'ramucirumab', 'necitumumab'
-    ]
-    
-    # Look for known drug names
-    for drug in known_drugs:
-        if drug in query_lower:
-            return drug
-    
-    # Try to extract drug names using patterns
-    # Look for -mab suffix (monoclonal antibodies)
-    mab_pattern = r'\b(\w+mab)\b'
-    mab_matches = re.findall(mab_pattern, query_lower)
-    if mab_matches:
-        return mab_matches[0]
-    
-    # Look for words after "using", "with", "drug", etc.
-    patterns = [
-        r'using\s+(\w+)',
-        r'with\s+(\w+)',
-        r'drug\s+(\w+)',
-        r'medication\s+(\w+)',
-        r'treatment\s+(\w+)',
-        r'therapy\s+(\w+)'
-    ]
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, query_lower)
-        if matches and len(matches[0]) > 3:  # Avoid short words
-            return matches[0]
-    
-    # Default to extracting the most likely drug name
-    words = query.split()
-    for word in words:
-        word_clean = re.sub(r'[^a-zA-Z]', '', word).lower()
-        if len(word_clean) > 4 and word_clean.endswith(('mab', 'nib', 'tib', 'zumab')):
-            return word_clean
-    
-    return ""
+    try:
+        # Prepare context about current study if available
+        study_context = ""
+        if current_study_data:
+            # Extract key intervention information from current study
+            interventions = current_study_data.get("Treatment Arms and Interventions", "")
+            if isinstance(interventions, dict):
+                interventions = interventions.get("content", "")
+            
+            study_overview = current_study_data.get("Study Overview", "")
+            if isinstance(study_overview, dict):
+                study_overview = study_overview.get("content", "")
+            
+            if interventions or study_overview:
+                study_context = f"""
+Current study context:
+- Study Overview: {study_overview[:200] if study_overview else 'Not available'}
+- Interventions: {interventions[:200] if interventions else 'Not available'}"""
+        
+        query_generation_prompt = f"""You are an expert in clinical trials research. A user is asking about finding similar clinical trials.
+
+User query: "{user_query}"
+{study_context}
+
+Your task: Generate a precise search query to find relevant clinical trials in a database. The search query should capture:
+1. Key drug names, interventions, or treatment combinations mentioned
+2. Disease areas or conditions if specified
+3. Treatment modalities (e.g., immunotherapy, chemotherapy, combination therapy)
+
+Instructions:
+- Extract and normalize drug names (e.g., "DTG" → "dolutegravir", "FTC" → "emtricitabine")
+- Include both abbreviations and full names when possible
+- For combination therapies, include individual components
+- Focus on the most relevant search terms that would find similar studies
+- Keep the search query concise but comprehensive
+- If no specific drugs are mentioned, use broader treatment categories
+
+Examples:
+- User: "fetch similar studies using DTG + TAF + FTC" → "dolutegravir tenofovir emtricitabine HIV combination"
+- User: "find other pembrolizumab trials" → "pembrolizumab immunotherapy anti-PD1"
+- User: "show me similar cancer studies" → "cancer oncology treatment"
+
+Generate only the search query, no explanations:"""
+        
+        response = llm.invoke([HumanMessage(content=query_generation_prompt)])
+        search_query = response.content.strip()
+        
+        # Fallback if search query is empty or too short
+        if not search_query or len(search_query.split()) < 2:
+            search_query = user_query.strip()
+        
+        return search_query
+        
+    except Exception as e:
+        print(f"⚠️  LLM search query generation error: {e}")
+        # Fallback to using the user query directly
+        return user_query.strip()
 
 
 def calculate_metrics(parsed_json: dict) -> tuple[float, float, list]:
@@ -1389,6 +1436,99 @@ Extract all required fields following the instructions."""
     return extracted_data
 
 
+def rag_search_node(state: WorkflowState) -> WorkflowState:
+    """Node: Dedicated RAG search for clinical trials"""
+    try:
+        query = state.get("chat_query", "")
+        
+        # Ensure query is a string
+        if isinstance(query, dict):
+            query = str(query)
+        elif not isinstance(query, str):
+            query = str(query)
+        
+        print(f"RAG Search Node - Processing query: {query}")
+        
+        # Generate search query using LLM based on user intent
+        current_study_data = state.get("data_to_summarize", {})
+        search_query = generate_rag_search_query(query, current_study_data)
+        
+        print(f"Generated search query: {search_query}")
+        
+        if not search_query or len(search_query.strip()) < 3:
+            print(f"WARNING: Could not generate meaningful search query from: {query}")
+            state["rag_tool_results"] = "Could not generate appropriate search query from your request."
+            state["use_rag_tool"] = False
+            state["error"] = "Could not generate search query for RAG search"
+            return state
+        
+        if not RAG_TOOL_AVAILABLE:
+            print(f"WARNING: RAG tool not available")
+            state["rag_tool_results"] = "Clinical trials search database is not available."
+            state["use_rag_tool"] = False
+            state["error"] = "RAG tool not available"
+            return state
+        
+        try:
+            # Initialize RAG tool
+            rag_tool = create_clinical_trials_rag_tool()
+            
+            # Search for similar studies using generated query
+            print(f"Searching RAG database for: {search_query}")
+            rag_results = rag_tool._run(
+                search_query=search_query,  # Using search_query instead of drug_name
+                n_results=8,  # Get more results for better context
+                conditions=None  # Could be enhanced to extract conditions from query
+            )
+            
+            # Store RAG results
+            state["rag_tool_results"] = rag_results
+            state["use_rag_tool"] = True
+            
+            print(f"RAG search completed for '{search_query}'")
+            print(f"RAG results length: {len(rag_results)} characters")
+            
+        except Exception as e:
+            print(f"ERROR: RAG tool error: {e}")
+            import traceback
+            traceback.print_exc()
+            state["rag_tool_results"] = f"Error during RAG search: {str(e)}"
+            state["use_rag_tool"] = False
+            state["error"] = f"RAG search failed: {str(e)}"
+            
+    except Exception as e:
+        print(f"ERROR: RAG search node error: {e}")
+        import traceback
+        traceback.print_exc()
+        state["rag_tool_results"] = f"RAG search node error: {str(e)}"
+        state["use_rag_tool"] = False
+        state["error"] = f"RAG node failed: {str(e)}"
+    
+    return state
+
+
+def route_decision_node(state: WorkflowState) -> WorkflowState:
+    """Node: Just pass through - routing is handled by conditional edges"""
+    return state
+
+
+def route_to_rag_or_chat(state: WorkflowState) -> Literal["rag_search", "chat_node"]:
+    """Conditional edge: Route to RAG search or directly to chat based on query type"""
+    query = state.get("chat_query", "")
+    
+    # Ensure query is a string
+    if isinstance(query, dict):
+        query = str(query)
+    elif not isinstance(query, str):
+        query = str(query)
+    
+    # Use RAG tool for similarity searches
+    if query and query != "generate_summary" and should_use_rag_tool(query):
+        return "rag_search"
+    else:
+        return "chat_node"
+
+
 def chat_node(state: WorkflowState) -> WorkflowState:
     """Node: Handle chat interactions with Q&A (with streaming support like app_v1)"""
     try:
@@ -1400,34 +1540,19 @@ def chat_node(state: WorkflowState) -> WorkflowState:
         elif not isinstance(query, str):
             query = str(query)
         
-        # Check if query should use RAG tool for clinical trials search
-        if query and query != "generate_summary" and should_use_rag_tool(query):
-            print(f"🔍 Detected RAG query: {query}")
+        # Check if we have RAG results from the rag_search_node
+        if state.get("use_rag_tool", False) and state.get("rag_tool_results"):
+            print(f"Chat Node - Processing RAG-enhanced query: {query}")
             
-            # Extract drug name from query
-            drug_name = extract_drug_name_from_query(query)
+            # Create enhanced response using both study data and RAG results
+            data_to_summarize = state.get("data_to_summarize", {})
+            rag_results = state["rag_tool_results"]
             
-            if drug_name and RAG_TOOL_AVAILABLE:
-                try:
-                    # Initialize RAG tool
-                    rag_tool = create_clinical_trials_rag_tool()
-                    
-                    # Search for similar studies
-                    rag_results = rag_tool._run(
-                        drug_name=drug_name,
-                        n_results=8,  # Get more results for better context
-                        conditions=None  # Could be enhanced to extract conditions from query
-                    )
-                    
-                    # Store RAG results
-                    state["rag_tool_results"] = rag_results
-                    state["use_rag_tool"] = True
-                    
-                    # Create enhanced response using both study data and RAG results
-                    data_to_summarize = state["data_to_summarize"]
-                    context = json.dumps(data_to_summarize, indent=2)
-                    
-                    enhanced_prompt = f"""You are a clinical research assistant. The user asked: "{query}"
+            # Handle both RAG-only queries and queries with study context
+            if data_to_summarize and any(data_to_summarize.values()):
+                # We have current study data - compare with RAG results
+                context = json.dumps(data_to_summarize, indent=2)
+                enhanced_prompt = f"""You are a clinical research assistant. The user asked: "{query}"
 
 You have access to two sources of information:
 
@@ -1438,36 +1563,49 @@ You have access to two sources of information:
 {rag_results}
 
 **Instructions:**
-- First, answer the user's question about similar studies using the database search results
-- Then, if relevant, relate it back to the current study data
+- Answer the user's question about similar studies using the database search results
+- Focus on studies that use similar drug combinations or individual components
 - Be specific about study NCT IDs, drug names, and provide clickable URLs
-- Highlight key similarities and differences
+- Highlight key similarities and differences in treatments, phases, and outcomes
+- Compare the found studies with the current study data when relevant
 - Keep the response well-organized and informative
+- If no similar studies were found, explain that and suggest alternative approaches
 
 Please provide a comprehensive answer that addresses the user's question about similar studies."""
-                    
-                    messages = [
-                        SystemMessage(content="You are a clinical research assistant expert at finding and explaining clinical trial similarities. Provide detailed, well-formatted responses with specific study references and URLs."),
-                        HumanMessage(content=enhanced_prompt)
-                    ]
-                    
-                    # Generate response with RAG context
-                    response_text = ""
-                    for chunk in llm.stream(messages):
-                        if hasattr(chunk, 'content'):
-                            response_text += chunk.content
-                    
-                    state["chat_response"] = response_text
-                    return state
-                    
-                except Exception as e:
-                    print(f"⚠️  RAG tool error: {e}")
-                    # Fall back to normal chat processing
-                    state["use_rag_tool"] = False
             else:
-                print(f"⚠️  Could not extract drug name from query: {query}")
-                state["use_rag_tool"] = False
+                # RAG-only query without current study context
+                enhanced_prompt = f"""You are a clinical research assistant. The user asked: "{query}"
+
+You have access to clinical trials database search results:
+
+**Similar Clinical Trials from Database Search:**
+{rag_results}
+
+**Instructions:**
+- Answer the user's question using the database search results
+- Focus on studies that match the requested drug combinations or criteria
+- Be specific about study NCT IDs, drug names, and provide clickable URLs
+- Highlight key information about treatments, phases, and outcomes
+- Keep the response well-organized and informative
+- If no similar studies were found in the database, explain that clearly and suggest alternative approaches
+
+Please provide a comprehensive answer that addresses the user's question about similar studies."""
+            
+            messages = [
+                SystemMessage(content="You are a clinical research assistant expert at finding and explaining clinical trial similarities. When users ask about similar studies or drug combinations, always search the database first. Provide detailed, well-formatted responses with specific study references and URLs."),
+                HumanMessage(content=enhanced_prompt)
+            ]
+            
+            # Generate response with RAG context
+            response_text = ""
+            for chunk in llm.stream(messages):
+                if hasattr(chunk, 'content'):
+                    response_text += chunk.content
+            
+            state["chat_response"] = response_text
+            return state
         
+        # Handle regular queries (summary generation or non-RAG questions)
         if not query or query == "generate_summary":
             # Generate initial summary using EXACT app_v1 prompt
             data_to_summarize = state["data_to_summarize"]
@@ -1591,6 +1729,67 @@ def chat_node_stream(state: WorkflowState) -> Iterator[str]:
     try:
         query = state.get("chat_query", "")
         
+        # Check if we have RAG results to stream
+        if state.get("use_rag_tool", False) and state.get("rag_tool_results"):
+            # Create enhanced response using RAG results
+            data_to_summarize = state.get("data_to_summarize", {})
+            rag_results = state["rag_tool_results"]
+            
+            # Handle both RAG-only queries and queries with study context
+            if data_to_summarize and any(data_to_summarize.values()):
+                # We have current study data - compare with RAG results
+                context = json.dumps(data_to_summarize, indent=2)
+                enhanced_prompt = f"""You are a clinical research assistant. The user asked: "{query}"
+
+You have access to two sources of information:
+
+1. **Current Study Data:**
+{context}
+
+2. **Similar Clinical Trials from Database Search:**
+{rag_results}
+
+**Instructions:**
+- Answer the user's question about similar studies using the database search results
+- Focus on studies that use similar drug combinations or individual components
+- Be specific about study NCT IDs, drug names, and provide clickable URLs
+- Highlight key similarities and differences in treatments, phases, and outcomes
+- Compare the found studies with the current study data when relevant
+- Keep the response well-organized and informative
+- If no similar studies were found, explain that and suggest alternative approaches
+
+Please provide a comprehensive answer that addresses the user's question about similar studies."""
+            else:
+                # RAG-only query without current study context
+                enhanced_prompt = f"""You are a clinical research assistant. The user asked: "{query}"
+
+You have access to clinical trials database search results:
+
+**Similar Clinical Trials from Database Search:**
+{rag_results}
+
+**Instructions:**
+- Answer the user's question using the database search results
+- Focus on studies that match the requested drug combinations or criteria
+- Be specific about study NCT IDs, drug names, and provide clickable URLs
+- Highlight key information about treatments, phases, and outcomes
+- Keep the response well-organized and informative
+- If no similar studies were found in the database, explain that clearly and suggest alternative approaches
+
+Please provide a comprehensive answer that addresses the user's question about similar studies."""
+            
+            messages = [
+                SystemMessage(content="You are a clinical research assistant expert at finding and explaining clinical trial similarities. When users ask about similar studies or drug combinations, always search the database first. Provide detailed, well-formatted responses with specific study references and URLs."),
+                HumanMessage(content=enhanced_prompt)
+            ]
+            
+            # Stream RAG response
+            for chunk in llm.stream(messages):
+                if hasattr(chunk, 'content'):
+                    yield chunk.content
+            return
+        
+        # Handle regular queries (summary generation or non-RAG questions)
         if not query or query == "generate_summary":
             # Generate initial summary
             data_to_summarize = state["data_to_summarize"]
@@ -1733,7 +1932,9 @@ def build_workflow() -> StateGraph:
     workflow.add_node("pdf_parser", parse_pdf)
     workflow.add_node("url_extractor", extract_from_url)
     workflow.add_node("llm_fallback", llm_fallback)
+    workflow.add_node("rag_search", rag_search_node)
     workflow.add_node("chat_node", chat_node)
+    workflow.add_node("route_decision", route_decision_node)
     
     # Add edges
     workflow.set_entry_point("classify_input")
@@ -1744,6 +1945,7 @@ def build_workflow() -> StateGraph:
         {
             "pdf_parser": "pdf_parser",
             "url_extractor": "url_extractor",
+            "route_decision": "route_decision",  # New path for RAG-only and follow-up queries
             "error": END
         }
     )
@@ -1753,7 +1955,7 @@ def build_workflow() -> StateGraph:
         check_quality,
         {
             "llm_fallback": "llm_fallback",
-            "chat_node": "chat_node"
+            "chat_node": "route_decision"
         }
     )
     
@@ -1762,11 +1964,26 @@ def build_workflow() -> StateGraph:
         check_quality,
         {
             "llm_fallback": "llm_fallback",
+            "chat_node": "route_decision"
+        }
+    )
+    
+    # Route from llm_fallback to decision point
+    workflow.add_edge("llm_fallback", "route_decision")
+    
+    # Route decision point decides between RAG search and direct chat
+    workflow.add_conditional_edges(
+        "route_decision",
+        route_to_rag_or_chat,
+        {
+            "rag_search": "rag_search",
             "chat_node": "chat_node"
         }
     )
     
-    workflow.add_edge("llm_fallback", "chat_node")
+    # RAG search always goes to chat after completing search
+    workflow.add_edge("rag_search", "chat_node")
+    
     workflow.add_edge("chat_node", END)
     
     return workflow.compile()
