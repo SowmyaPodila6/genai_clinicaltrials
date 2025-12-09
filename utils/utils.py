@@ -6,11 +6,15 @@ Database, PDF generation, and helper functions
 import sqlite3
 import json
 import unicodedata
+import os
+from pathlib import Path
 from fpdf import FPDF
 from typing import Dict, List, Tuple, Optional
 
-# Database configuration
-DB_FILE = "chat_history.db"
+# Database configuration - use absolute path to avoid issues
+current_dir = Path(__file__).parent
+parent_dir = current_dir.parent
+DB_FILE = str(parent_dir / "data" / "chat_history.db")
 
 
 # ============================================================================
@@ -19,6 +23,11 @@ DB_FILE = "chat_history.db"
 
 def get_db_connection():
     """Create database connection and ensure table exists"""
+    # Ensure the database directory exists
+    db_dir = os.path.dirname(DB_FILE)
+    if not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+    
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''

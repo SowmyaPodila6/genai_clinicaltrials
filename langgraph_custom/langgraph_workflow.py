@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 # gpt-4o-mini is 15x cheaper and has 128k context window (same as gpt-4o)
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1, streaming=True)
 
+# Create a non-streaming LLM instance for re-extraction
+llm_non_streaming = ChatOpenAI(model="gpt-4o-mini", temperature=0.1, streaming=False)
+
 # System message for GPT-4 summarization (from app_v1)
 SYSTEM_MESSAGE = "You are a clinical research summarization expert. Create concise, well-formatted summaries that focus only on available information. Avoid filler text and sections with insufficient data. Use clear markdown formatting and keep summaries under 400 words while including all key available information."
 
@@ -1987,6 +1990,15 @@ def build_workflow() -> StateGraph:
     workflow.add_edge("chat_node", END)
     
     return workflow.compile()
+
+
+def get_shared_llm_instance():
+    """Get the shared non-streaming LLM instance for re-extraction"""
+    return llm_non_streaming
+
+def get_workflow():
+    """Get the workflow app instance"""
+    return build_workflow()
 
 
 # Main execution

@@ -9,6 +9,7 @@ import uuid
 import sqlite3
 import sys
 import os
+import time
 from pathlib import Path
 
 # Add parent directory to path to import from langgraph folder
@@ -35,9 +36,14 @@ def get_cached_conversations():
     return get_all_conversations()
 
 # Database functions (same as app_v1)
-DB_FILE = "chat_history.db"
+DB_FILE = str(parent_dir / "data" / "chat_history.db")
 
 def get_db_connection():
+    # Ensure the database directory exists
+    db_dir = os.path.dirname(DB_FILE)
+    if not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+    
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
@@ -208,7 +214,12 @@ def create_extraction_results_tabs(state):
     if "active_extraction_tab" not in st.session_state.ui_state:
         st.session_state.ui_state["active_extraction_tab"] = 0  # Default to first tab
     
-    # Create tabs with selection state
+    # Callback function to update tab state
+    def update_tab_selection():
+        if "extraction_tab_selector" in st.session_state:
+            st.session_state.ui_state["active_extraction_tab"] = st.session_state.extraction_tab_selector
+    
+    # Create tabs with selection state and callback
     tab_names = ["📊 Extraction Metrics", "📄 View JSON"]
     selected_tab = st.radio(
         "Select View", 
@@ -217,10 +228,11 @@ def create_extraction_results_tabs(state):
         index=st.session_state.ui_state["active_extraction_tab"],
         horizontal=True,
         key="extraction_tab_selector",
-        label_visibility="collapsed"
+        label_visibility="collapsed",
+        on_change=update_tab_selection
     )
     
-    # Update session state with current selection
+    # Update session state with current selection (fallback)
     st.session_state.ui_state["active_extraction_tab"] = selected_tab
     
     # Add some spacing
@@ -282,8 +294,15 @@ def create_extraction_results_tabs(state):
                     st.metric("Tokens", f"{cost_est.get('total_tokens', 0):,}")
     
     elif selected_tab == 1:  # View JSON tab
-        # Call existing JSON view function
-        create_json_view_tabs(state)
+        # CRITICAL: Always use the most current state from session_state for JSON view
+        current_state = st.session_state.get('current_state', state)
+        
+        # Force refresh check for debugging
+        ui_state = st.session_state.get("ui_state", {})
+        if ui_state.get("force_json_refresh"):
+            st.info("🔄 **Status:** Displaying refreshed JSON data after re-extraction")
+        
+        create_json_view_tabs(current_state)
         
         # Add regenerate summary button at the bottom
         st.divider()
@@ -291,7 +310,9 @@ def create_extraction_results_tabs(state):
         st.caption("After reviewing and refining the extracted fields, click below to regenerate the summary with updated data")
         
         if st.button("🔄 Regenerate Summary", key="regenerate_summary_btn", use_container_width=True, type="primary"):
-            _regenerate_summary(state)
+            # Use the most current state from session_state if available
+            current_state = st.session_state.get('current_state', state)
+            _regenerate_summary(current_state)
 
 def create_json_view_tabs(state):
     """Create tabs for viewing JSON data with collapsible sections"""
@@ -299,6 +320,15 @@ def create_json_view_tabs(state):
     parser_json = state.get("parser_only_json", {})
     used_llm = state.get("used_llm_fallback", False)
     nct_id = state.get("nct_id", "study")
+    
+    # Debug info for re-extractions
+    ui_state = st.session_state.get("ui_state", {})
+    if ui_state.get("force_json_refresh"):
+        last_field = ui_state.get("last_reextraction_field", "unknown")
+        last_time = ui_state.get("last_reextraction_time", 0)
+        st.info(f"🔄 **Debug:** JSON view refreshed after re-extracting '{last_field}' at {time.strftime('%H:%M:%S', time.localtime(last_time))}")
+        # Clear the flag after showing the debug info
+        st.session_state.ui_state["force_json_refresh"] = False
     
     # Define field metadata
     field_info = {
@@ -472,6 +502,12 @@ def _render_json_sections(json_data, field_info, prefix):
                         use_container_width=True
                     )
                 
+                # Preserve the active tab when refinement button is clicked
+                if refine_btn:
+                    if "ui_state" not in st.session_state:
+                        st.session_state.ui_state = {}
+                    st.session_state.ui_state["active_extraction_tab"] = 1  # Stay on View JSON tab
+                
                 # Show refinement interface if button clicked or if recently re-extracted
                 show_refine_ui = (refine_btn or 
                                 st.session_state.get(f"show_refine_{field}", False) or 
@@ -514,6 +550,10 @@ def _render_json_sections(json_data, field_info, prefix):
                             # Clear the refinement UI
                             if f"show_refine_{field}" in st.session_state:
                                 del st.session_state[f"show_refine_{field}"]
+                            # Preserve the active tab state (View JSON tab = 1)
+                            if "ui_state" not in st.session_state:
+                                st.session_state.ui_state = {}
+                            st.session_state.ui_state["active_extraction_tab"] = 1
                             st.rerun()
                 
             else:
@@ -596,13 +636,22 @@ def _reextract_field_with_feedback(field_name: str, feedback: str):
             st.error("Insufficient text available for re-extraction. Please start a new extraction.")
             return
         
-        # Initialize extractor
-        extractor = MultiTurnExtractor(
+        # Initialize extractor with shared LLM instance
+        try:
+            from langgraph_custom.langgraph_workflow import get_shared_llm_instance
+            shared_llm = get_shared_llm_instance()
+            
+            extractor = MultiTurnExtractor(
                 model="gpt-4o-mini",
                 temperature=0.1,
                 max_tokens_per_call=180000,
-                delay_between_calls=2.0
+                delay_between_calls=2.0,
+                llm_instance=shared_llm  # Use the shared LLM instance
             )
+            
+        except Exception as e:
+            st.error(f"Failed to initialize extractor: {str(e)}")
+            return
             
         with st.spinner(f"Re-extracting {field_name.replace('_', ' ').title()} with your feedback..."):
             # Re-extract this specific field with feedback
@@ -636,6 +685,13 @@ def _reextract_field_with_feedback(field_name: str, feedback: str):
                     content = str(content) if content else ""
                 st.session_state.current_state["data_to_summarize"][display_key] = content
                 
+                # CRITICAL: Force UI state cache invalidation to ensure JSON view updates
+                if "ui_state" not in st.session_state:
+                    st.session_state.ui_state = {}
+                st.session_state.ui_state["force_json_refresh"] = True
+                st.session_state.ui_state["last_reextraction_field"] = field_name
+                st.session_state.ui_state["last_reextraction_time"] = time.time()
+                
                 # Save updated state to database
                 save_extraction_state(st.session_state.current_convo_id, st.session_state.current_state)
                 
@@ -651,18 +707,36 @@ def _reextract_field_with_feedback(field_name: str, feedback: str):
                 st.session_state.messages.append({"role": "system", "content": reextraction_msg})
                 save_message_to_db(st.session_state.current_convo_id, "system", reextraction_msg, "re-extraction", metadata)
                 
+                # Also show the actual re-extracted content in chat
+                content = refined_result.get("content", "") if isinstance(refined_result, dict) else str(refined_result) if refined_result else ""
+                if content:
+                    reextracted_content_msg = f"**📋 Updated {field_name.replace('_', ' ').title()}:**\n\n{content[:500]}{'...' if len(content) > 500 else ''}"
+                    st.session_state.messages.append({"role": "assistant", "content": reextracted_content_msg, "type": "re-extracted_content"})
+                    save_message_to_db(st.session_state.current_convo_id, "assistant", reextracted_content_msg, "re-extracted_content", {
+                        "field": field_name,
+                        "original_feedback": feedback,
+                        "content_length": len(content)
+                    })
+                
                 # Don't clear refinement UI state - let user see the success message in context
                 # Keep the tab on View JSON to show updated results
+                if "ui_state" not in st.session_state:
+                    st.session_state.ui_state = {}
                 st.session_state.ui_state["active_extraction_tab"] = 1  # View JSON tab
-                
-                st.success(f"✅ Successfully re-extracted {field_name.replace('_', ' ').title()}!")
-                st.info("💡 The results have been updated below. You can now regenerate the summary if needed.")
                 
                 # Set flag to update UI without full state loss
                 st.session_state[f"reextracted_{field_name}"] = True
                 
-                # Use experimental_rerun to refresh display while maintaining state
-                time.sleep(0.5)  # Brief pause to show success message
+                # Clear any refinement UI state to close the feedback form
+                if f"show_refine_{field_name}" in st.session_state:
+                    del st.session_state[f"show_refine_{field_name}"]
+                
+                # Show success without full page rerun - let the UI update naturally
+                st.success(f"✅ Re-extraction completed! Field '{field_name}' has been updated.")
+                st.info(f"🔍 **Debug Info:** Updated content length: {len(content)} characters")
+                st.info("💡 The updated results are now visible in the View JSON tab below.")
+                
+                # Use rerun to update the display
                 st.rerun()
             else:
                 st.error("Re-extraction failed. Please try again with different feedback.")
@@ -691,16 +765,170 @@ def _reextract_field_with_feedback(field_name: str, feedback: str):
         save_message_to_db(st.session_state.current_convo_id, "system", 
                          f"⚠️ Re-extraction error for {field_name.replace('_', ' ').title()}: {str(e)}", 
                          "error", error_metadata)
+
+def _auto_reextract_empty_fields():
+    """Automatically re-extract all empty or minimal fields"""
+    if not st.session_state.get("current_state"):
+        st.error("No active extraction to process")
+        return
+    
+    state = st.session_state.current_state
+    parsed_data = state.get("parsed_json", {})
+    empty_fields = []
+    
+    # Find empty or minimal fields
+    for field, value in parsed_data.items():
+        if isinstance(value, dict):
+            content = value.get("content", "")
+        else:
+            content = str(value) if value else ""
+        
+        # Check if field is empty or has minimal content
+        if not content or len(content.strip()) <= 10:
+            empty_fields.append(field)
+    
+    if not empty_fields:
+        st.info("🎉 All fields already have substantial content!")
+        return
+    
+    # Show which fields will be re-extracted
+    st.info(f"📋 Found {len(empty_fields)} fields to re-extract: {', '.join([f.replace('_', ' ').title() for f in empty_fields])}")
+    
+    # Process each empty field individually
+    success_count = 0
+    failed_fields = []
+    
+    for i, field in enumerate(empty_fields):
+        with st.spinner(f"🔄 Re-extracting field {i+1}/{len(empty_fields)}: {field.replace('_', ' ').title()}..."):
+            try:
+                from langgraph_custom.multi_turn_extractor import MultiTurnExtractor
+                
+                # Get full text
+                full_text = st.session_state.get("cached_full_text") or state.get("full_text")
+                if not full_text:
+                    failed_fields.append(field)
+                    continue
+                
+                # Initialize extractor with shared LLM instance
+                try:
+                    from langgraph_custom.langgraph_workflow import get_shared_llm_instance
+                    shared_llm = get_shared_llm_instance()
+                    
+                    extractor = MultiTurnExtractor(
+                        model="gpt-4o-mini",
+                        temperature=0.1,
+                        max_tokens_per_call=180000,
+                        delay_between_calls=2.0,
+                        llm_instance=shared_llm  # Use shared LLM
+                    )
+                    
+                except Exception as init_error:
+                    st.error(f"Failed to initialize extractor for {field}: {str(init_error)}")
+                    failed_fields.append(field)
+                    continue
+                
+                # Re-extract this field
+                refined_result = extractor.extract_field_with_feedback(
+                    full_text,
+                    field,
+                    "Field was empty, please try to extract again with more focus and detail"
+                )
+                
+                if refined_result:
+                    # Update the state
+                    state["parsed_json"][field] = refined_result
+                    
+                    # Update data_to_summarize
+                    field_mapping = {
+                        "study_overview": "Study Overview",
+                        "brief_description": "Brief Description",
+                        "primary_secondary_objectives": "Primary and Secondary Objectives",
+                        "treatment_arms_interventions": "Treatment Arms and Interventions",
+                        "eligibility_criteria": "Eligibility Criteria",
+                        "enrollment_participant_flow": "Enrollment and Participant Flow",
+                        "adverse_events_profile": "Adverse Events Profile",
+                        "study_locations": "Study Locations",
+                        "sponsor_information": "Sponsor Information"
+                    }
+                    
+                    display_key = field_mapping.get(field, field)
+                    content = refined_result.get("content", "") if isinstance(refined_result, dict) else str(refined_result) if refined_result else ""
+                    if content:
+                        state["data_to_summarize"][display_key] = content
+                    
+                    success_count += 1
+                    st.success(f"✅ {field.replace('_', ' ').title()}")
+                    
+                    # Show the extracted content in chat for this field
+                    content = refined_result.get("content", "") if isinstance(refined_result, dict) else str(refined_result) if refined_result else ""
+                    if content:
+                        field_content_msg = f"**📋 Auto-extracted {field.replace('_', ' ').title()}:**\n\n{content[:300]}{'...' if len(content) > 300 else ''}"
+                        st.session_state.messages.append({"role": "assistant", "content": field_content_msg, "type": "auto_extracted_content"})
+                        save_message_to_db(st.session_state.current_convo_id, "assistant", field_content_msg, "auto_extracted_content", {
+                            "field": field,
+                            "content_length": len(content),
+                            "auto_extraction": True
+                        })
+                else:
+                    failed_fields.append(field)
+                    
+            except Exception as e:
+                failed_fields.append(field)
+                st.error(f"❌ {field.replace('_', ' ').title()}: {str(e)}")
+    
+    # Save updated state
+    if success_count > 0:
+        save_extraction_state(st.session_state.current_convo_id, state)
+        
+        # Log the auto re-extraction activity
+        auto_reextract_msg = f"🔄 Auto re-extracted {success_count} empty fields"
+        metadata = {
+            "action": "auto_re_extraction",
+            "success_count": success_count,
+            "failed_count": len(failed_fields),
+            "processed_fields": empty_fields
+        }
+        st.session_state.messages.append({"role": "system", "content": auto_reextract_msg})
+        save_message_to_db(st.session_state.current_convo_id, "system", auto_reextract_msg, "auto_re_extraction", metadata)
+        
+        # Add summary of what was extracted
+        if success_count > 0:
+            successful_fields = [f for f in empty_fields if f not in failed_fields]
+            summary_msg = f"✅ **Auto-extraction complete!** Successfully extracted content for: {', '.join([f.replace('_', ' ').title() for f in successful_fields])}"
+            if failed_fields:
+                summary_msg += f"\n\n⚠️ Failed to extract: {', '.join([f.replace('_', ' ').title() for f in failed_fields])}"
+            st.session_state.messages.append({"role": "assistant", "content": summary_msg, "type": "auto_extraction_summary"})
+            save_message_to_db(st.session_state.current_convo_id, "assistant", summary_msg, "auto_extraction_summary", metadata)
+    
+    # Show final results
+    if success_count > 0:
+        st.success(f"✅ Successfully re-extracted {success_count} out of {len(empty_fields)} fields!")
+        if failed_fields:
+            st.warning(f"⚠️ Failed to re-extract: {', '.join([f.replace('_', ' ').title() for f in failed_fields])}")
+        st.info("💡 Check the View JSON tab to see the updated results.")
+        
+        # Switch to JSON view to show results
+        st.session_state.ui_state["active_extraction_tab"] = 1
+        time.sleep(1)
+        st.rerun()
+    else:
+        st.error("❌ Failed to re-extract any empty fields. Please try manual re-extraction with specific feedback.")
+
 def _regenerate_summary(state):
     """Regenerate summary with updated extracted data"""
     try:
         from langgraph_custom.langgraph_workflow import chat_node_stream
         
+        # Ensure we have valid state and data to work with
+        if not state or not state.get("parsed_json"):
+            st.error("No extraction data available to generate summary from.")
+            return
+        
         with st.spinner("🔄 Regenerating summary with updated data..."):
             # Update data_to_summarize with current parsed_json
             field_mapping = {
                 "study_overview": "Study Overview",
-                "brief_description": "Brief Description",
+                "brief_description": "Brief Description", 
                 "primary_secondary_objectives": "Primary and Secondary Objectives",
                 "treatment_arms_interventions": "Treatment Arms and Interventions",
                 "eligibility_criteria": "Eligibility Criteria",
@@ -712,6 +940,8 @@ def _regenerate_summary(state):
             
             # Rebuild data_to_summarize from current parsed_json
             state["data_to_summarize"] = {}
+            fields_with_content = 0
+            
             for field, value in state.get("parsed_json", {}).items():
                 if isinstance(value, dict):
                     content = value.get("content", "")
@@ -725,6 +955,13 @@ def _regenerate_summary(state):
                 if content and content.strip():
                     display_key = field_mapping.get(field, field)
                     state["data_to_summarize"][display_key] = content
+                    fields_with_content += 1
+            
+            # Check if we have enough data to generate a meaningful summary
+            if fields_with_content < 3:
+                st.warning(f"Only {fields_with_content} fields have content. Consider re-extracting empty fields before regenerating summary.")
+                if not st.button("Continue anyway", key="continue_regenerate"):
+                    return
             
             # Generate new summary
             with st.chat_message("assistant"):
@@ -747,19 +984,37 @@ def _regenerate_summary(state):
                         st.download_button(
                             label="📄 Download PDF",
                             data=pdf_data,
-                            file_name=f"summary_{state.get('nct_id', 'study')}_updated.pdf",
+                            file_name=f"summary_{state.get('nct_id', 'study')}_updated_{int(time.time())}.pdf",
                             mime="application/pdf",
-                            key="regenerated_pdf_download"
+                            key=f"regenerated_pdf_download_{int(time.time())}"
                         )
                     except Exception as e:
                         st.error("PDF error")
                 st.markdown("---")
             
-            # Save to messages and database
-            st.session_state.messages.append({"role": "assistant", "content": full_response})
-            save_message_to_db(st.session_state.current_convo_id, "assistant", full_response)
+            # Save to messages and database with metadata to indicate regenerated summary
+            summary_metadata = {
+                "action": "regenerate_summary",
+                "timestamp": time.time(),
+                "fields_count": len([k for k, v in state.get('parsed_json', {}).items() if v]),
+                "nct_id": state.get('nct_id', 'study'),
+                "fields_with_content": fields_with_content
+            }
             
-            st.success("✅ Summary regenerated successfully!")
+            # Add a brief regeneration notice before the full summary
+            regen_notice = f"🔄 **Summary Regenerated** using {fields_with_content} fields from {state.get('nct_id', 'the study')}"
+            st.session_state.messages.append({"role": "system", "content": regen_notice, "type": "regeneration_notice"})
+            save_message_to_db(st.session_state.current_convo_id, "system", regen_notice, "regeneration_notice", summary_metadata)
+            
+            # Add the full regenerated summary
+            st.session_state.messages.append({"role": "assistant", "content": full_response, "type": "regenerated_summary"})
+            save_message_to_db(st.session_state.current_convo_id, "assistant", full_response, "regenerated_summary", summary_metadata)
+            
+            # Update the current state with the new summary info
+            state["last_summary_regenerated"] = time.time()
+            save_extraction_state(st.session_state.current_convo_id, state)
+            
+            st.success("✅ Summary regenerated successfully! You can regenerate again anytime as you continue refining fields.")
             
     except Exception as e:
         st.error(f"Error regenerating summary: {str(e)}")

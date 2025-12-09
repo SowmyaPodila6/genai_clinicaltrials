@@ -65,32 +65,27 @@ class MultiTurnExtractor:
         model: str = "gpt-4o-mini",
         temperature: float = 0.1,
         max_tokens_per_call: int = 180000,  # Leave buffer under 200k limit
-        delay_between_calls: float = 2.0  # Seconds
+        delay_between_calls: float = 2.0,  # Seconds
+        llm_instance: Optional[ChatOpenAI] = None  # Accept existing LLM instance
     ):
-        """Initialize the multi-turn extractor with structured outputs using Pydantic schemas."""
-        # Get the JSON schema from Pydantic for structured outputs
-        extraction_schema = get_extraction_result_schema_dict()
+        """Initialize the multi-turn extractor with shared LLM configuration."""
         
-        # Initialize LLM with structured output format based on Pydantic schema
-        self.llm = ChatOpenAI(
-            model=model, 
-            temperature=temperature,
-            model_kwargs={
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "clinical_trial_extraction",
-                        "description": "Structured extraction of clinical trial information with content and page references",
-                        "schema": extraction_schema,
-                        "strict": True
-                    }
-                }
-            }
-        )
+        # Use provided LLM instance or create a new simple one (no structured outputs)
+        if llm_instance:
+            self.llm = llm_instance
+            logger.info("Using provided LLM instance for re-extraction")
+        else:
+            # Create simple LLM instance like the main workflow (no json_schema)
+            self.llm = ChatOpenAI(
+                model=model, 
+                temperature=temperature,
+                streaming=False  # Disable streaming for re-extraction
+            )
+            logger.info(f"Created new LLM instance for re-extraction: {model}")
+            
         self.max_tokens_per_call = max_tokens_per_call
         self.delay_between_calls = delay_between_calls
         self.encoding = tiktoken.encoding_for_model(model)
-        self.extraction_schema = extraction_schema
         
     def extract_page_numbers_from_text(self, text: str, content: str) -> List[int]:
         """
