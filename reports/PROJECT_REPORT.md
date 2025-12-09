@@ -9,15 +9,104 @@
 
 ## Executive Summary
 
-This project implements an intelligent two-phase clinical trial document analysis system using LangGraph workflows and GPT-4o. The system combines automated extraction and summarization (Phase 1) with semantic search and retrieval-augmented generation (Phase 2). It processes clinical trial data from ClinicalTrials.gov URLs and PDF protocols, providing comprehensive analysis and comparative insights through an interactive chat interface.
+ClinicalIQ is an intelligent clinical trial analysis platform that automates document processing and enables semantic search across clinical trial databases. Built with Streamlit and LangGraph, the system extracts structured information from clinical trial protocols and provides conversational access to comparative trial data.
 
-**Key Technical Features:**
-- **Two-phase architecture:** Extraction/Summarization (Phase 1) + RAG Search (Phase 2)
-- **Dual-source support:** ClinicalTrials.gov API and PDF documents with intelligent quality routing
-- **Multi-turn extraction:** Field-by-field extraction with user feedback and re-extraction capabilities
-- **Vector-based RAG:** ChromaDB integration for semantic search across clinical trials database
-- **9-field standardized schema:** Comprehensive clinical trial data structure with citation support
-- **Interactive UI:** ClinicalIQ-branded Streamlit interface with conversation history and streaming responses
+**Core Capabilities:**
+- Automated extraction of 9 standardized clinical trial fields from PDFs and ClinicalTrials.gov URLs
+- Quality-based routing: parser-only extraction for high-quality sources, GPT-4o-mini fallback for complex documents
+- Human-in-the-loop refinement with field-level approval and re-extraction
+- Natural language summarization of extracted trials (<400 words, markdown formatted)
+- Interactive Q&A on extracted content: users ask questions about specific fields, system provides contextual answers from parsed data
+- Retrieval Augemented Generation(RAG) semantic search across clinical trials database using ChromaDB
+- Conversational interface with streaming responses and chat history persistence (SQLite)
+
+## Technology Stack
+
+**Backend Framework:**
+- Python 3.11.9
+- LangGraph 0.6.10 (Workflow orchestration)
+- LangChain 0.3.18 (LLM integration)
+- ChromaDB 0.4.x (Vector database)
+
+**Frontend:**
+- Streamlit 1.50.0 (Web interface)
+- Custom CSS for ClinicalIQ branding
+
+**AI/ML Services:**
+- OpenAI GPT-4o-mini (Text generation)
+- OpenAI text-embedding-ada-002 (Vector embeddings)
+
+**PDF Processing:**
+- pdfplumber 0.11.4 (Primary PDF extraction)
+- PyPDF2 3.0.1 (Fallback PDF processing)
+- pdfminer.six 20231228 (Deep text extraction)
+
+**Data Storage:**
+- SQLite 3.x (Conversation history, session management)
+- ChromaDB (Vector storage and similarity search)
+- File system (PDF cache, temporary files)
+
+**Environment Variables:**
+- `OPENAI_API_KEY`: Required for GPT-4o-mini and embeddings
+- `CHROMA_DB_PATH`: Vector database location (default: ./db/clinical_trials_vectordb)
+- `STREAMLIT_SERVER_PORT`: Web interface port (default: 8501)
+- `MAX_UPLOAD_SIZE`: Maximum PDF file size (default: 200MB)
+
+---
+
+## Project Structure
+
+```
+genai_clinicaltrials/
+├── UI/
+│   └── app.py                      # Streamlit main application
+├── langgraph_custom/
+│   ├── __init__.py
+│   ├── langgraph_workflow.py       # LangGraph workflow engine
+│   ├── multi_turn_extractor.py     # Multi-turn extraction logic
+│   ├── enhanced_parser.py          # PDF parsing with multi-method
+│   ├── extraction_schemas.py       # Pydantic schemas for data validation
+│   ├── prompts.py                  # LLM prompt templates
+│   ├── rag_tool.py                 # RAG search implementation
+│   └── vector_db_manager.py        # ChromaDB operations
+├── db/
+│   └── clinical_trials_vectordb/   # ChromaDB persistent storage
+├── uploads/                        # Temporary PDF storage
+├── utils/
+│   └── utils.py                    # Utility functions
+├── reports/                        # Project documentation
+├── requirements.txt                # Python dependencies
+├── .env                           # Environment configuration
+└── README.md                      # Setup and usage guide
+```
+### How the System Works
+
+**Phase 1: Document Processing, Extraction & Summarization**
+Users provide either a PDF clinical trial protocol or a ClinicalTrials.gov URL (with NCT identifier). The system routes to the appropriate extraction method:
+- **URL input:** Fetches structured JSON from ClinicalTrials.gov API v2
+- **PDF input:** Uses EnhancedClinicalTrialParser with multi-method extraction (pdfplumber → PyPDF2 → pdfminer.six)
+
+After extraction, the system calculates confidence and completeness scores. If scores fall below thresholds (confidence < 0.5 OR completeness < 0.6), the workflow automatically triggers GPT-4o-mini for intelligent re-extraction using the MultiTurnExtractor.
+
+Once extraction completes, the `chat_node` generates a natural language summary of the clinical trial using GPT-4o-mini with the SYSTEM_MESSAGE prompt (400-word limit, markdown formatting). Users can then ask follow-up questions about the extracted content (e.g., "What are the inclusion criteria?" or "Summarize the adverse events"), and the system streams contextual responses based on the parsed_json data.
+
+**Phase 2: Retrieval Augmented Generation (RAG) Powered Search**
+Users can query the clinical trials database conversationally (e.g., "Find similar HIV treatment studies"). The system:
+1. Generates query embeddings using OpenAI's text-embedding-ada-002
+2. Performs vector similarity search in ChromaDB (cosine similarity, threshold > 0.3)
+3. Retrieves top 5 relevant trials with metadata filtering
+4. Generates contextual responses using GPT-4o-mini with retrieved trial summaries
+
+**User Interface Features**
+
+The Streamlit web app (UI/app.py) provides:
+- **File/URL Input:** PDF upload (max 200MB) with validation, or URL input with automatic NCT ID extraction
+- **Chat Interface:** Streaming responses using `chat_node_stream()` with token-by-token display and cursor indicator
+- **Session Management:** SQLite database stores conversations, extraction states, and uploaded file metadata across sessions
+- **Extraction Results:** Tabbed interface showing metrics (confidence, completeness, field counts) and JSON viewer with expandable fields
+- **Human-in-the-Loop:** Field-level approval/refinement buttons trigger targeted re-extraction via MultiTurnExtractor
+- **Export Options:** Download extracted data as JSON or generate PDF summaries with embedded metadata
+- **Performance Caching:** `@st.cache_resource` for workflow initialization, `@st.cache_data(ttl=60)` for database queries
 
 ---
 
@@ -64,7 +153,7 @@ This project implements an intelligent two-phase clinical trial document analysi
 │                                │                               │
 │                                ▼                               │
 │  ╔═════════════════════════════════════════════════════════════╗  │
-│  ║                    PHASE 2: RAG SEARCH                     ║  │
+│  ║         PHASE 2: RAG POWERED SEARCH & ANALYSIS            ║  │
 │  ╠═════════════════════════════════════════════════════════════╣  │
 │  ║                                                             ║  │
 │  ║  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ║  │
@@ -96,103 +185,130 @@ This project implements an intelligent two-phase clinical trial document analysi
 ### 1.2 Phase Architecture Details
 
 #### 1.2.1 Phase 1: Extraction & Summarization
-**Purpose:** Extract structured data from clinical trial documents and generate comprehensive summaries
 
-**Key Components:**
-- **Enhanced PDF Parser:** Multi-method extraction (pdfplumber, PyPDF2, pdfminer.six)
-- **ClinicalTrials.gov API Integration:** Direct data fetching from structured sources
-- **Multi-Turn Extractor:** Field-by-field extraction with user feedback loops
-- **Quality-based Routing:** Confidence/completeness metrics determine LLM fallback
-- **Re-extraction Capabilities:** Users can provide feedback to refine specific fields
+**Step 1: Input Classification** (`classify_input` node)
+- Detects NCT IDs (regex: `NCT\d{8}`) → classifies as URL
+- Detects .pdf extension or 'pdf' in path → classifies as PDF
+- Empty input with chat query → classifies as RAG-only or followup
 
-**Data Flow:**
-1. Input classification (PDF vs URL)
-2. Primary extraction (parser vs API)
-3. Quality evaluation (confidence + completeness scores)
-4. LLM fallback if quality thresholds not met
-5. Structured summary generation
-6. User feedback and re-extraction loops
+**Step 2: Primary Extraction** (conditional routing)
+- **URL path:** `extract_from_url` node fetches JSON from ClinicalTrials.gov API v2, maps response to 9-field schema
+- **PDF path:** `parse_pdf` node instantiates EnhancedClinicalTrialParser, tries pdfplumber (primary) → PyPDF2 (fallback) → pdfminer.six (last resort). Uses regex patterns to identify clinical trial sections and extract content with page references.
 
-#### 1.2.2 Phase 2: RAG Search & Comparative Analysis
-**Purpose:** Provide semantic search and comparative insights across clinical trials database
+**Step 3: Quality Evaluation** (`check_quality` node)
+- Calculates confidence score (0.0-1.0) based on extraction method, content length, structured elements presence
+- Calculates completeness score as percentage of 9 fields with >30 chars and non-placeholder text
+- Routes to LLM fallback if confidence < 0.5 OR completeness < 0.6
 
-**Key Components:**
-- **ChromaDB Vector Database:** Stores embeddings of clinical trial protocols
-- **Semantic Search:** Natural language queries for finding similar studies
-- **RAG Tool Integration:** Retrieval-Augmented Generation for enhanced responses
-- **Comparative Analysis:** Side-by-side comparison of treatment approaches
-- **Query Classification:** Intelligent routing between extraction and search modes
+**Step 4: LLM Fallback** (conditional, `llm_multi_turn_fallback` node)
+- Uses MultiTurnExtractor to process document field-by-field with GPT-4o-mini
+- Each field extracted independently with targeted prompts, avoiding rate limits
+- Returns structured JSON validated against schemas, updates `parsed_json` and sets `used_llm_fallback = True`
 
-**Data Flow:**
-1. Query analysis and intent classification
-2. Vector similarity search in ChromaDB
-3. Context retrieval and ranking
-4. Enhanced response generation with retrieved context
-5. Comparative insights and recommendations
-  - Download options (JSON, TXT formats)
-  - Performance optimizations with `@st.cache_resource` and `@st.cache_data`
+**Step 5: Summary Generation & Interactive Q&A** (`chat_node`)
+- **Initial Summary:** Formats extracted `parsed_json` into natural language using GPT-4o-mini with SYSTEM_MESSAGE prompt ("clinical research summarization expert", <400 words, markdown formatting)
+- **Citation Integration:** Includes page numbers, confidence/completeness scores, extraction method, NCT ID
+- **Streaming Output:** Token-by-token display with cursor indicator ("▌")
+- **Follow-up Questions:** Users can query specific fields ("What are the eligibility criteria?") or request refinements
+  - System classifies query intent: extraction (current document) vs. search (database RAG)
+  - Extracts relevant fields from `parsed_json` or `data_to_summarize`
+  - Generates contextual responses with GPT-4o-mini streaming
+  - Maintains conversation history in SQLite for context awareness
+- **Field Refinement:** Users can approve/request re-extraction of specific fields via UI buttons, triggering targeted MultiTurnExtractor calls
 
-#### 1.2.2 Workflow Engine (langgraph_workflow.py)
-- **Framework:** LangGraph 0.6.10
-- **State Management:** TypedDict-based WorkflowState
+#### 1.2.2 Phase 2: Retrieval Augmented Generation (RAG) Powered Search
+
+**Step 1: Query Classification** (`should_use_rag_tool` function)
+- Detects search intent via keywords: "similar", "compare", "find studies", drug names, conditions
+- Routes to RAG if detected, otherwise treats as document-specific question
+
+**Step 2: Query Enhancement**
+- Extracts context from current study: condition, intervention, phase
+- Appends to query: "[Context: HIV, Dolutegravir, Phase III]"
+
+**Step 3: Vector Search** (ChromaDB)
+- Generates query embedding (1536-dim) via text-embedding-ada-002
+- Computes cosine similarity against stored trial vectors
+- Filters results with similarity > 0.3
+- Returns top 5 trials with metadata
+
+**Step 4: Response Generation** (`chat_node` with RAG results)
+- Constructs prompt with: user query + current study summary + top 3 retrieved trials
+- GPT-4o-mini generates comparative response with NCT ID citations
+- Streams response token-by-token to UI
+
+### 1.3 Component Architecture
+- **Framework:** LangGraph 0.6.10 with StateGraph and conditional routing
+- **State:** TypedDict `WorkflowState` with 20+ fields including `parsed_json`, `confidence_score`, `used_llm_fallback`, `rag_tool_results`
+- **LLM:** ChatOpenAI with gpt-4o-mini (streaming and non-streaming instances)
 - **Nodes:**
-  1. **classify_input:** Determines if input is PDF or URL
-  2. **parse_pdf:** Extracts data using EnhancedClinicalTrialParser
-  3. **extract_from_url:** Fetches data from ClinicalTrials.gov API
-  4. **check_quality:** Evaluates extraction quality (conditional edge)
-  5. **llm_fallback:** GPT-4o full document extraction with citations
-  6. **chat_node:** Generates summaries and answers questions
+  - `classify_input`: Detects PDF/URL/RAG-only via regex and path analysis
+  - `parse_pdf`: EnhancedClinicalTrialParser with multi-method fallback
+  - `extract_from_url`: ClinicalTrials.gov API v2 fetcher
+  - `check_quality`: Calculates confidence/completeness, routes to LLM if needed
+  - `llm_multi_turn_fallback`: MultiTurnExtractor for field-by-field extraction
+  - `chat_node`: Generates summaries, handles follow-up Q&A on extracted content, RAG integration, streaming responses
+- **Routing:** Conditional edges based on input_type and quality thresholds
+- **Query Classification:** `should_use_rag_tool()` distinguishes document-specific questions from database searches
 
-#### 1.2.3 PDF Parser (enhanced_parser.py)
-- **Multi-method extraction:**
-  - pdfplumber (primary)
-  - PyPDF2 (fallback)
-  - pdfminer.six (deep extraction)
-- **Section detection:** Pattern-based clinical trial section identification
-- **Table extraction:** Structured data extraction
-- **Optional features:** OCR (Tesseract), NLP (spaCy) - disabled for performance
+#### 1.3.2 PDF Parser (enhanced_parser.py)
+- **Multi-method extraction:** pdfplumber (primary) → PyPDF2 (fallback) → pdfminer.six (last resort)
+- **Section detection:** Regex patterns for clinical trial headers ("Objectives", "Inclusion Criteria", etc.)
+- **Table extraction:** pdfplumber's layout analysis for structured data
+- **Output:** ClinicalTrialData object with 9 fields + page_references dict
+- **Optional features:** OCR (Tesseract) and NLP (spaCy) disabled by default for performance
 
-#### 1.3.4 Data Schema & Standards
-**9-Field Standardized Structure with Citations:**
-1. `study_overview` - Title, NCT ID, phase, disease [Page refs]
-2. `brief_description` - Study summary and background [Page refs]
-3. `primary_secondary_objectives` - Endpoints and outcome measures [Page refs]
-4. `treatment_arms_interventions` - Arms, drugs, doses, schedules [Page refs]
-5. `eligibility_criteria` - Inclusion/exclusion criteria [Page refs]
-6. `enrollment_participant_flow` - Patient numbers and disposition [Page refs]
-7. `adverse_events_profile` - Safety data and AE tables [Page refs]
-8. `study_locations` - Sites, countries, investigators [Page refs]
-9. `sponsor_information` - Sponsor, collaborators, CRO [Page refs]
+#### 1.3.3 Data Schema & Standards
 
-**Enhanced Data Structure:**
+**9-Field Standardized Structure:**
+
+1. **study_overview**: Title, NCT ID, phase, condition, study type, design
+2. **brief_description**: 2-4 paragraph summary of purpose, background, rationale
+3. **primary_secondary_objectives**: Primary/secondary endpoints with measurement timepoints
+4. **treatment_arms_interventions**: Arm names, sample sizes, drug details (name, dosage, route, duration)
+5. **eligibility_criteria**: Inclusion/exclusion criteria, medical requirements
+6. **enrollment_participant_flow**: Target/actual enrollment, participant disposition, demographics
+7. **adverse_events_profile**: Common/serious AEs with incidence rates, grade 3/4 labs, discontinuations
+8. **study_locations**: Countries, site counts, principal investigators, coordinating centers
+9. **sponsor_information**: Primary sponsor, collaborators, CROs, funding sources
+
+**Enhanced Data Structure with Metadata:**
+
+Each field is stored as a JSON object with metadata enabling quality tracking and source attribution:
+
 ```json
 {
-  "content": "Extracted field content",
-  "page_numbers": [1, 2, 3],
+  "content": "Detailed text content",
+  "page_numbers": [5, 6, 7],
   "confidence_score": 0.85,
-  "extraction_method": "multi_turn_llm"|"parser"|"api"
+  "extraction_method": "multi_turn_llm",
+  "last_updated": "2025-12-08T14:32:00Z",
+  "word_count": 247
 }
 ```
 
-### 1.4 Quality Metrics & Routing
+- **Citation tracking:** `page_numbers` array records PDF pages containing the information
+- **Quality assessment:** `confidence_score` (0.0-1.0) indicates extraction reliability
+- **Provenance:** `extraction_method` (api/pdfplumber/pypdf2/multi_turn_llm) shows data source
+- **Update management:** `last_updated` timestamp tracks refinements
+- **Completeness:** `word_count` measures content richness (threshold: 30 chars)
 
-**Phase 1 Quality Assessment:**
-- **Confidence Score:** Based on content richness and extraction method reliability
-- **Completeness Score:** Percentage of 9 fields with meaningful data (>30 chars)
-- **Citation Quality:** Availability and accuracy of page number references
-- **Multi-Turn Capability:** Re-extraction with user feedback for quality improvement
+### 1.4 Quality Metrics & Intelligent Routing
 
-**Phase 2 Retrieval Quality:**
-- **Semantic Similarity:** Vector cosine similarity scores for retrieved documents
-- **Context Relevance:** LLM-based relevance scoring of retrieved passages
-- **Answer Completeness:** Coverage of user query across retrieved documents
-- **Citation Accuracy:** Proper attribution of retrieved information sources
+**Confidence Score:** Weighted metric (0.0-1.0) based on extraction method (40%), content length (30%), structured elements (20%), and citation availability (10%). Threshold: 0.5.
+
+**Completeness Score:** Percentage of 9 fields with >30 chars and non-placeholder text. Threshold: 0.6.
+
+**Multi-Turn Refinement:** Users can request field-specific re-extraction via UI buttons, triggering targeted MultiTurnExtractor calls with feedback context.
+
+**RAG Quality Metrics:**
+- **Semantic Similarity:** Cosine similarity scores (0.0-1.0) with threshold > 0.3
+- **Context Relevance:** Secondary LLM validation of retrieved content relevance
+- **Citation Accuracy:** NCT ID verification and similarity score reporting
 
 **Intelligent Routing Logic:**
-- Phase 1 triggers when document extraction/summarization needed
-- Phase 2 triggers when comparative analysis or similar study search requested
-- Hybrid mode combines current document analysis with database search
-- Quality thresholds determine LLM fallback vs parser-only extraction
+
+The system routes between Phase 1 (extraction) and Phase 2 (RAG search) based on input type and user intent. Within Phase 1, quality thresholds (confidence ≥ 0.5 AND completeness ≥ 0.6) determine whether LLM fallback is needed. If thresholds are met, the system proceeds to summary generation; otherwise, MultiTurnExtractor performs intelligent re-extraction.
 
 ---
 
@@ -201,13 +317,54 @@ This project implements an intelligent two-phase clinical trial document analysi
 ### 2.1 Phase 1: Extraction Quality Metrics
 
 #### 2.1.1 Confidence Score Calculation
-The confidence score evaluates the quality and reliability of extracted content based on:
-- **Content richness**: Longer, more detailed content receives higher scores
-- **Extraction method reliability**: Multi-turn LLM extraction gets highest score, API second, parser baseline
-- **Citation availability**: Content with page number references gets bonus points
-- **Structured data presence**: Content containing numbers, lists, and structured elements scores higher
+The confidence score evaluates the quality and reliability of extracted content through a weighted formula:
 
-Final score ranges from 0.0 to 1.0, with scores below 0.5 triggering LLM fallback.
+**Calculation Formula:**
+```
+Confidence = (Method_Score × 0.4) + (Content_Score × 0.3) + (Structure_Score × 0.2) + (Citation_Score × 0.1)
+```
+
+**Component Breakdown:**
+
+1. **Method Score (Weight: 40%)**
+   - Multi-turn LLM extraction: 1.0 (most reliable, understands context)
+   - ClinicalTrials.gov API: 0.9 (structured source, high accuracy)
+   - Clean PDF parse with pdfplumber: 0.7 (good quality but may miss nuances)
+   - Fallback PyPDF2 extraction: 0.5 (basic text, may have formatting issues)
+   - Degraded pdfminer extraction: 0.3 (poor quality, many errors likely)
+
+2. **Content Score (Weight: 30%)**
+   - Based on character count:
+     - >500 characters: 1.0 (comprehensive detail)
+     - 200-500 characters: 0.7 (adequate information)
+     - 50-200 characters: 0.4 (minimal information)
+     - <50 characters: 0.1 (insufficient data)
+   - Adjusted down if content contains placeholder phrases like "not specified", "N/A", "to be determined"
+
+3. **Structure Score (Weight: 20%)**
+   - Presence of structured elements increases score:
+     - Contains numbered/bulleted lists: +0.3
+     - Contains specific numeric data (doses, counts, percentages): +0.3
+     - Contains tables or tabular data: +0.2
+     - Contains section headers or clear organization: +0.2
+   - Maximum: 1.0, Minimum: 0.0 (unstructured prose only)
+
+4. **Citation Score (Weight: 10%)**
+   - Has specific page number references: 1.0
+   - Has section references but no page numbers: 0.5
+   - No citations available: 0.0
+
+**Example Calculation:**
+
+Field: "treatment_arms_interventions" extracted from PDF
+- Method: pdfplumber (clean parse) → Method_Score = 0.7
+- Content: 420 characters with detailed dosing → Content_Score = 0.7
+- Structure: Contains numbered list and dosages → Structure_Score = 0.6
+- Citation: Pages 12-14 referenced → Citation_Score = 1.0
+
+Confidence = (0.7 × 0.4) + (0.7 × 0.3) + (0.6 × 0.2) + (1.0 × 0.1) = 0.28 + 0.21 + 0.12 + 0.10 = **0.71**
+
+This score of 0.71 is above the 0.5 threshold, so no LLM fallback is triggered for this field.
 
 #### 2.1.2 Completeness Score Calculation
 The completeness score measures how many of the 9 standard fields contain meaningful data:
@@ -228,11 +385,18 @@ This ensures high-quality extraction while minimizing unnecessary API costs.
 ### 2.2 Phase 2: RAG Quality Metrics
 
 #### 2.2.1 Vector Similarity Scoring
-Vector similarity uses cosine similarity to measure semantic closeness between queries and documents:
-- **Embedding comparison**: Compares query embeddings with document embeddings in vector space
-- **Cosine similarity**: Measures angle between vectors, ranging from 0.0 (no similarity) to 1.0 (identical)
-- **Normalization**: Ensures consistent scoring regardless of vector magnitude
-- **Threshold filtering**: Results below 0.3 similarity are filtered out to maintain relevance
+
+**Cosine Similarity Formula:**
+```
+cosine_similarity = (A · B) / (||A|| × ||B||)
+```
+Where A · B is the dot product and ||A||, ||B|| are vector magnitudes.
+
+**Threshold Filtering:**
+- Similarity ≥ 0.7: Highly relevant
+- Similarity 0.5-0.7: Moderately relevant
+- Similarity 0.3-0.5: Weakly relevant
+- Similarity < 0.3: Not relevant (filtered out)
 
 #### 2.2.2 Context Relevance Scoring
 LLM-based relevance evaluation ensures retrieved contexts directly address user queries:
@@ -247,36 +411,11 @@ This dual-layer approach (vector + LLM) improves response accuracy and user sati
 
 ## 3. RAG Query Formation and Processing
 
-### 3.1 Query Classification
+### 3.1 Query Classification & Enhancement
 
-#### 3.1.1 Intent Detection
-The system automatically classifies user queries to determine the appropriate processing approach:
+**Intent Detection:** System classifies queries as extraction (document-specific), search (database RAG), or hybrid based on keywords and patterns.
 
-**Query Categories:**
-- **Extraction**: Document analysis and summarization requests ("extract", "summarize", "objectives")
-- **Search**: Finding similar studies or comparative analysis ("similar studies", "compare", drug names)
-- **Hybrid**: Current document analysis with comparative context (default for ambiguous queries)
-
-**Classification Process:**
-- Analyzes query text for specific keywords and patterns
-- Scores each category based on indicator presence
-- Routes to highest-scoring category or defaults to hybrid mode
-- Enables intelligent switching between Phase 1 and Phase 2 operations
-
-#### 3.1.2 Query Enhancement for RAG
-Queries are automatically enhanced with context from the current study to improve retrieval accuracy:
-
-**Context Extraction:**
-- **Disease terms**: Primary condition and therapeutic area
-- **Drug information**: Treatment names and intervention types
-- **Study phase**: Clinical trial phase for appropriate comparisons
-- **Patient population**: Demographics and eligibility criteria
-
-**Enhancement Process:**
-- Extracts relevant terms from current study overview and interventions
-- Appends context terms to user query for better semantic matching
-- Maintains original user intent while improving search precision
-- Example: "side effects" becomes "side effects (context: HIV, DTG, Phase III)"
+**Query Enhancement:** Automatically appends context from current study (condition, intervention, phase) to improve RAG retrieval accuracy.
 
 ### 3.2 Vector Database Operations
 
@@ -367,131 +506,55 @@ Queries are automatically enhanced with context from the current study to improv
 
 ## 4. Database Architecture and Usage
 
-### 4.1 ChromaDB Vector Database Design
+### 4.1 ChromaDB Vector Database
 
-**Core Configuration:**
-- **Storage**: Persistent ChromaDB with SQLite backend at `./db/clinical_trials_vectordb/`
-- **Embedding Model**: OpenAI text-embedding-ada-002
-- **Collection**: "clinical_trials" with automatic creation and state persistence
+**Storage:** Persistent SQLite backend at `./db/clinical_trials_vectordb/` with ACID compliance
 
-**Metadata Structure:**
-- **Study Identifiers**: NCT ID, titles, document references
-- **Classifications**: Phase, study type, intervention model, therapeutic area
-- **Medical Context**: Conditions, treatments, MeSH terms, outcomes
-- **Administrative**: Sponsors, collaborators, regulatory details
-- **Timeline**: Study dates, enrollment data, demographics
-- **Technical**: Extraction methods, confidence scores, processing timestamps
+**Embeddings:** OpenAI text-embedding-ada-002 (1536-dim vectors) automatically generated on document insertion
+
+**Metadata Schema:**
+- **Identifiers:** NCT ID, study title, short title
+- **Classification:** Phase, study type, intervention model, therapeutic area
+- **Medical Context:** Condition, interventions, MeSH terms, outcomes
+- **Administrative:** Sponsors, collaborators, regulatory info
+- **Timeline:** Start/completion dates, enrollment periods
+- **Geography:** Countries, facility locations
+- **Technical:** Confidence scores, page numbers, extraction methods
 
 **Query Capabilities:**
-- **Filtering**: Phase, condition, sponsor, date ranges, enrollment size
-- **Search Types**: Exact match, multiple values, numerical ranges, text patterns
-- **Complex Logic**: AND/OR combinations for precise study targeting
+- Metadata filtering before vector similarity computation
+- Multiple filter types: exact match, multiple values, numerical ranges, text patterns
+- Complex boolean logic (AND/OR combinations)
 
-### 4.2 Database Operations
+### 4.2 Document Ingestion & Maintenance
 
-**Document Ingestion:**
-- **Parallel Processing**: Concurrent document processing with configurable thread pools
-- **Batch Operations**: Efficient grouped database writes with error handling
-- **Quality Validation**: Documents validated before insertion with retry logic
+**Ingestion Pipeline:**
+1. **Chunking:** Split by 9-field sections with page attribution
+2. **Embedding:** Auto-generated via text-embedding-ada-002
+3. **Validation:** Check confidence (>0.4), completeness (≥3 fields), NCT ID
+4. **Storage:** Batch inserts (50 docs) with retry logic (3 attempts, exponential backoff)
+
+**Parallel Processing:** ThreadPoolExecutor (4 threads) for concurrent document processing
 
 **Maintenance:**
-- **Deduplication**: Content-based duplicate detection and cleanup
-- **Embedding Updates**: Automatic re-generation when models change
-- **Performance Optimization**: Regular maintenance runs and health monitoring
+- **Deduplication:** SHA-256 content hash matching
+- **Embedding Updates:** Regenerate vectors when model changes
+- **Optimization:** Monthly index rebuilds and SQLite compaction (20-30% speed improvement)
 
 ---
 
-## 5. Technology Stack and Dependencies
+## 5. Conclusion
 
-### 5.1 Core Technologies
+ClinicalIQ provides an end-to-end solution for clinical trial document analysis, combining intelligent extraction with semantic search capabilities:
 
-**Backend Framework:**
-- Python 3.11.9
-- LangGraph 0.6.10 (Workflow orchestration)
-- LangChain 0.3.18 (LLM integration)
-- ChromaDB 0.4.x (Vector database)
+**Core Features:**
+- **Adaptive extraction:** Quality-based routing between parser-only and GPT-4o-mini fallback
+- **Human-in-the-loop:** Field-level approval and refinement via MultiTurnExtractor
+- **Semantic search:** ChromaDB vector database with cosine similarity (threshold > 0.3)
+- **Conversational UI:** Streamlit with streaming responses and SQLite persistence
+- **Production-ready:** Modular architecture, comprehensive error handling, caching optimizations
 
-**Frontend:**
-- Streamlit 1.50.0 (Web interface)
-- Custom CSS for ClinicalIQ branding
-
-**AI/ML Services:**
-- OpenAI GPT-4o-mini (Text generation)
-- OpenAI text-embedding-ada-002 (Vector embeddings)
-
-**PDF Processing:**
-- pdfplumber 0.11.4 (Primary PDF extraction)
-- PyPDF2 3.0.1 (Fallback PDF processing)
-- pdfminer.six 20231228 (Deep text extraction)
-
-**Data Storage:**
-- SQLite 3.x (Conversation history, session management)
-- ChromaDB (Vector storage and similarity search)
-- File system (PDF cache, temporary files)
-
-### 5.2 Environment Configuration
-
-**Required Environment Variables:**
-- `OPENAI_API_KEY`: OpenAI API key for GPT-4o-mini and embeddings
-
-**Optional Configuration:**
-- `CHROMA_DB_PATH`: Vector database storage location (default: ./db/clinical_trials_vectordb)
-- `STREAMLIT_SERVER_PORT`: Web interface port (default: 8501)
-- `LOG_LEVEL`: Application logging level (default: INFO)
-- `MAX_UPLOAD_SIZE`: Maximum PDF file size (default: 200MB)
-
-### 5.3 File Structure Overview
-
-```
-genai_clinicaltrials/
-├── UI/
-│   └── app.py                      # Streamlit main application
-├── langgraph_custom/
-│   ├── __init__.py
-│   ├── langgraph_workflow.py       # LangGraph workflow engine
-│   ├── multi_turn_extractor.py     # Multi-turn extraction logic
-│   ├── enhanced_parser.py          # PDF parsing with multi-method
-│   ├── extraction_schemas.py       # Pydantic schemas for data validation
-│   ├── prompts.py                  # LLM prompt templates
-│   ├── rag_tool.py                 # RAG search implementation
-│   └── vector_db_manager.py        # ChromaDB operations
-├── db/
-│   └── clinical_trials_vectordb/   # ChromaDB persistent storage
-├── uploads/                        # Temporary PDF storage
-├── utils/
-│   └── utils.py                    # Utility functions
-├── reports/                        # Project documentation
-├── requirements.txt                # Python dependencies
-├── .env                           # Environment configuration
-└── README.md                      # Setup and usage guide
-```
-
----
-
-## 6. Conclusion
-
-The Clinical Trial Analysis System Version 2.0 demonstrates a robust two-phase architecture that effectively combines document analysis with semantic search capabilities. The system's technical foundation provides:
-
-**Phase 1 - Extraction & Summarization:**
-- Intelligent quality-based routing with configurable thresholds
-- Multi-turn extraction with user feedback loops
-- Comprehensive citation tracking and validation
-- Performance optimizations through caching and intelligent chunking
-
-**Phase 2 - RAG Search & Analysis:**
-- Advanced vector similarity search with metadata filtering
-- Contextual query enhancement using current study information
-- Sophisticated response generation with comparative analysis
-- Scalable database architecture supporting large document collections
-
-**Technical Strengths:**
-- ✓ Modular, maintainable codebase with clear separation of concerns
-- ✓ Comprehensive metrics calculation for quality assessment
-- ✓ Advanced database operations with optimization strategies
-- ✓ Flexible query processing with multiple intent classification
-- ✓ Production-ready error handling and logging
-
-This architecture provides a solid foundation for clinical trial document analysis while maintaining flexibility for future enhancements and scalability requirements.
+The system is deployed on the `ui_enhancements` branch with full database integration, RAG tool support, and human feedback loops for quality assurance.
 
 ---
 
