@@ -1,51 +1,52 @@
 # Clinical Trial Analysis System - Dependencies
 # Core Application
-streamlit>=1.28.0
-openai>=1.0.0
-python-dotenv>=1.0.0
-tiktoken>=0.5.0
+streamlit
+openai
+python-dotenv
+tiktoken
 
 # LangGraph Workflow Engine
-langgraph>=0.2.0
-langchain>=0.1.0
-langchain-openai>=0.0.5
-langchain-core>=0.1.0
-langchain-community>=0.0.20
+langgraph
+langchain>=0.2.0
+langchain-openai>=0.1.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+pydantic-settings
 
 # PDF Processing
-PyMuPDF>=1.23.0
-pdfplumber>=0.10.0
-pdfminer.six>=20221105
-Pillow>=10.0.0
-PyPDF2>=3.0.0
+PyMuPDF
+pdfplumber
+pdfminer.six
+Pillow
+PyPDF2
 
 # OCR Support (Optional)
-pytesseract>=0.3.10
+pytesseract
 
 # NLP Support (Optional)
 spacy>=3.7.0
 
 # Data Processing
-pandas>=2.0.0
-numpy>=1.24.0
+pandas
+numpy
 
 # HTTP and Utilities
-requests>=2.31.0
-fpdf>=1.7.2
+requests
+fpdf
 
 # Vector Database and Embeddings
-chromadb>=0.4.18
-sentence-transformers>=2.2.2
-faiss-cpu>=1.7.4
+chromadb
+sentence-transformers
+faiss-cpu
 
 # Visualization and Development
-graphviz>=0.20.0
-matplotlib>=3.7.0
+graphviz
+matplotlib
 
 # Testing Framework
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
+pytest
+pytest-asyncio
 
 # Document Generation (Utilities)
-python-docx>=0.8.11
-markdown>=3.4.0
+python-docx
+markdown
