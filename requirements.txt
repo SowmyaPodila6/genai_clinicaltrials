@@ -24,18 +24,18 @@ PyPDF2
 pytesseract
 
 # NLP Support (Optional)
-spacy>=3.7.0
+spacy
 
 # Data Processing
 pandas
-numpy
+numpy>=1.22.5,<2.0.0
 
 # HTTP and Utilities
 requests
 fpdf
 
 # Vector Database and Embeddings
-chromadb
+chromadb>=0.4.0
 sentence-transformers
 faiss-cpu
 

@@ -4,6 +4,9 @@ Following official LangGraph documentation patterns
 Integrated with app_v1.py functionality
 """
 
+import os
+os.environ['PYDANTIC_V2'] = 'true'
+
 from typing import TypedDict, Annotated, Literal, Iterator, Optional, Callable
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI

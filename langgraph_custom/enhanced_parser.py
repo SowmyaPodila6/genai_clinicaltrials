@@ -46,9 +46,12 @@ except ImportError:
     logging.warning("OCR libraries not available. Install Pillow and pytesseract for scanned PDF support.")
 
 # Optional: NLP support for better section detection
-# Temporarily disabled due to SpaCy compatibility issues with Python 3.14
-NLP_AVAILABLE = False
-logging.warning("spaCy disabled due to compatibility issues with Python 3.14. Enhanced section detection unavailable.")
+try:
+    import spacy
+    NLP_AVAILABLE = True
+except ImportError:
+    NLP_AVAILABLE = False
+    logging.warning("spaCy not available. Install spaCy for enhanced section detection.")
 
 # Configure logging
 logging.basicConfig(
