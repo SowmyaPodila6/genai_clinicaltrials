@@ -5,7 +5,7 @@ A comprehensive AI-powered system for clinical trial document analysis with inte
 ## 🚀 Quick Setup
 
 ### Prerequisites
-- **Python 3.11+** , (It does not work with Pyton 3.14. Dated 2025-12-18.)
+- **Python 3.11+** , (It does not work with Pyton 3.14. Dated 2025-12-18. I am using 3.13.)
 - **OpenAI API Key** (required)
 
 ### 1. Clone & Install
@@ -28,7 +28,7 @@ pip install -r requirements.txt
 ### 2. Set API Key
 ```bash
 # Windows PowerShell:
-$env:OPENAI_API_KEY="your-api-key-here"
+setx OPENAI_API_KEY "your-api-key-here"
 
 # macOS/Linux/WSL:
 export OPENAI_API_KEY="your-api-key-here"
