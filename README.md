@@ -5,7 +5,7 @@ A comprehensive AI-powered system for clinical trial document analysis with inte
 ## 🚀 Quick Setup
 
 ### Prerequisites
-- **Python 3.11+** 
+- **Python 3.11+** , (It does not work with Pyton 3.14. Dated 2025-12-18.)
 - **OpenAI API Key** (required)
 
 ### 1. Clone & Install
